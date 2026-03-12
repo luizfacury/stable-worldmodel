@@ -170,7 +170,7 @@ class HDF5Dataset(Dataset):
             if col != 'action':
                 data = data[:: self.frameskip]
 
-            if data.dtype == np.object_:
+            if data.dtype == np.object_ or data.dtype.kind in ('S', 'U'):
                 steps[col] = data.tolist()
             else:
                 steps[col] = torch.from_numpy(data)
@@ -293,7 +293,7 @@ class FolderDataset(Dataset):
                 if col != 'action':
                     data = data[:: self.frameskip]
 
-            if data.dtype == np.object_:
+            if data.dtype == np.object_ or data.dtype.kind in ('S', 'U'):
                 steps[col] = data.tolist()
             else:
                 steps[col] = torch.from_numpy(data)
@@ -374,7 +374,7 @@ class VideoDataset(FolderDataset):
                 if col != 'action':
                     data = data[:: self.frameskip]
 
-                if data.dtype == np.object_:
+                if data.dtype == np.object_ or data.dtype.kind in ('S', 'U'):
                     steps[col] = data.tolist()
                 else:
                     steps[col] = torch.from_numpy(data)

@@ -1588,8 +1588,47 @@ class TestGoalDataset:
             )
 
 
+@pytest.fixture
+def sample_hdf5_with_string_column(tmp_path):
+    """Create a sample HDF5 dataset with a bytes string column."""
+    h5_path = tmp_path / 'string_col_test.h5'
+
+    ep_lengths = np.array([10])
+    ep_offsets = np.array([0])
+    total_steps = 10
+
+    with h5py.File(h5_path, 'w') as f:
+        f.create_dataset('ep_len', data=ep_lengths)
+        f.create_dataset('ep_offset', data=ep_offsets)
+        f.create_dataset(
+            'action', data=np.random.rand(total_steps, 2).astype(np.float32)
+        )
+        f.create_dataset(
+            'observation',
+            data=np.random.rand(total_steps, 4).astype(np.float32),
+        )
+        # Bytes string column (numpy.bytes_ dtype)
+        string_data = np.array(
+            [f'label_{i}'.encode() for i in range(total_steps)]
+        )
+        f.create_dataset('label', data=string_data)
+
+    return tmp_path, 'string_col_test'
+
+
 class TestHDF5DatasetEdgeCases:
     """Additional edge case tests for HDF5Dataset."""
+
+    def test_getitem_with_string_column(self, sample_hdf5_with_string_column):
+        """Test that loading a dataset with a bytes string column does not raise."""
+        cache_dir, name = sample_hdf5_with_string_column
+        dataset = HDF5Dataset(name, cache_dir=str(cache_dir))
+
+        item = dataset[0]
+
+        assert 'label' in item
+        assert isinstance(item['label'], list)
+        assert isinstance(item['label'][0], bytes)
 
     def test_grayscale_image_permutation(self, sample_hdf5_grayscale):
         """Test that grayscale images (1 channel) are permuted correctly."""
