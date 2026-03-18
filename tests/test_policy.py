@@ -723,7 +723,7 @@ def test_worldmodel_policy_warmstart_extends_partial_plan(actionable_setup):
 
 
 def test_worldmodel_policy_no_warmstart_without_actionable():
-    """Solver receives None init_action when model does not implement Actionable."""
+    """Solver receives a full zero init_action when model does not implement Actionable."""
     non_actionable_model = MagicMock(spec=['get_cost'])
     solver = MockSolverWithWarmStart(model=non_actionable_model)
     config = PlanConfig(
@@ -741,7 +741,8 @@ def test_worldmodel_policy_no_warmstart_without_actionable():
 
     policy.get_action(info)
 
-    assert solver.received_init_action is None
+    assert solver.received_init_action.shape == (1, 5, 2)
+    assert solver.received_init_action.eq(0).all()
 
 
 ###########################
