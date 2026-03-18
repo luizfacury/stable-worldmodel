@@ -1,13 +1,15 @@
 from typing import Any, Protocol, runtime_checkable
-
-import gymnasium as gym
+import numpy as np
 import torch
+import gymnasium as gym
 
 
 class Costable(Protocol):
     """Protocol for world model cost functions."""
 
-    def criterion(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
+    def criterion(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:
         """Compute the cost criterion for action candidates.
 
         Args:
@@ -19,7 +21,9 @@ class Costable(Protocol):
         """
         ...
 
-    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+    def get_cost(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:  # pragma: no cover
         """Compute cost for given action candidates based on info dictionary.
 
         Args:
@@ -36,7 +40,9 @@ class Costable(Protocol):
 class Solver(Protocol):
     """Protocol for model-based planning solvers."""
 
-    def configure(self, *, action_space: gym.Space, n_envs: int, config: Any) -> None:
+    def configure(
+        self, *, action_space: gym.Space, n_envs: int, config: Any
+    ) -> None:
         """Configure the solver with environment and planning specifications.
 
         Args:
@@ -61,7 +67,9 @@ class Solver(Protocol):
         """Planning horizon length in timesteps."""
         ...
 
-    def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
+    def solve(
+        self, info_dict: dict, init_action: torch.Tensor | None = None
+    ) -> dict:
         """Solve the planning optimization problem to find optimal actions.
 
         Args:
@@ -70,5 +78,54 @@ class Solver(Protocol):
 
         Returns:
             Dictionary containing optimized actions and other solver-specific info.
+        """
+        ...
+
+
+class Transformable(Protocol):
+    """Protocol for reversible data transformations (e.g., normalizers, scalers)."""
+
+    def transform(self, x: np.ndarray) -> np.ndarray:  # pragma: no cover
+        """Apply preprocessing to input data.
+
+        Args:
+            x: Input data as a numpy array.
+
+        Returns:
+            Preprocessed data as a numpy array.
+        """
+        ...
+
+    def inverse_transform(
+        self, x: np.ndarray
+    ) -> np.ndarray:  # pragma: no cover
+        """Reverse the preprocessing transformation.
+
+        Args:
+            x: Preprocessed data as a numpy array.
+
+        Returns:
+            Original data as a numpy array.
+        """
+        ...
+
+
+class Actionable(Protocol):
+    """Protocol for model action computation."""
+
+    def get_action(
+        info: dict, horizon: int = 1
+    ) -> torch.Tensor:  # pragma: no cover
+        """Compute action(s) from observation and goal.
+
+        Args:
+            info: Dictionary containing environment state information.
+            horizon: Number of actions to return. When 1 (default), returns a
+                single action of shape (..., action_dim). When > 1, returns an
+                action sequence of shape (..., horizon, action_dim).
+
+        Returns:
+            A tensor of actions with shape (..., action_dim) if horizon == 1,
+            or (..., horizon, action_dim) if horizon > 1.
         """
         ...

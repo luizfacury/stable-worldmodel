@@ -1,7 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from collections.abc import Callable
 
 import numpy as np
@@ -11,6 +11,7 @@ from torchvision import tv_tensors
 
 import stable_worldmodel as swm
 from stable_worldmodel.solver import Solver
+from stable_worldmodel.protocols import Actionable, Transformable
 
 
 @dataclass(frozen=True)
@@ -35,42 +36,6 @@ class PlanConfig:
     def plan_len(self) -> int:
         """Total plan length in environment steps."""
         return self.horizon * self.action_block
-
-
-class Transformable(Protocol):
-    """Protocol for reversible data transformations (e.g., normalizers, scalers)."""
-
-    def transform(self, x: np.ndarray) -> np.ndarray:  # pragma: no cover
-        """Apply preprocessing to input data.
-
-        Args:
-            x: Input data as a numpy array.
-
-        Returns:
-            Preprocessed data as a numpy array.
-        """
-        ...
-
-    def inverse_transform(
-        self, x: np.ndarray
-    ) -> np.ndarray:  # pragma: no cover
-        """Reverse the preprocessing transformation.
-
-        Args:
-            x: Preprocessed data as a numpy array.
-
-        Returns:
-            Original data as a numpy array.
-        """
-        ...
-
-
-class Actionable(Protocol):
-    """Protocol for model action computation."""
-
-    def get_action(info) -> torch.Tensor:  # pragma: no cover
-        """Compute action from observation and goal"""
-        ...
 
 
 class BasePolicy:
@@ -438,6 +403,8 @@ class TDMPCPolicy(BasePolicy):
         transform: Dictionary of tensor transformations (e.g., image transforms).
     """
 
+    # TODO no need for this policy, we could just use the WorldModelPolicy and add the actor warm-start logic as an option in the solver. This would be cleaner and more modular.
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -486,6 +453,8 @@ class TDMPCPolicy(BasePolicy):
         if self._action_buffer is not None:
             self._action_buffer.clear()
         self._next_init = None
+
+    # TODO encode and actor rollout should be done in the solver just like it is the case for CEM
 
     def _encode(self, info_dict: dict, device: torch.device) -> torch.Tensor:
         """Encode current observation and goal into latent state."""
