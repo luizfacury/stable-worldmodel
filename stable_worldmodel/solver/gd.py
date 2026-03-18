@@ -9,7 +9,8 @@ import torch
 from gymnasium.spaces import Box
 from loguru import logger as logging
 
-from .solver import Costable
+from stable_worldmodel.protocols import Costable
+from stable_worldmodel.solver.utils import build_init_action
 
 
 class GradientSolver(torch.nn.Module):
@@ -136,6 +137,9 @@ class GradientSolver(torch.nn.Module):
         }
 
         with torch.no_grad():
+            init_action = build_init_action(
+                self.model, info_dict, init_action, self.horizon
+            )
             self.init_action(init_action)
 
         # Determine batch size (default to all envs if not specified which can cause memory issues)

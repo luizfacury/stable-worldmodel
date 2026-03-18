@@ -263,6 +263,75 @@ class TDMPC2(nn.Module):
         z_a = torch.cat([z, action], dim=-1)
         return self.dynamics(z_a), self.reward(z_a)
 
+    def rollout(
+        self, z: torch.Tensor, horizon: int, num_trajs: int = 1
+    ) -> torch.Tensor:
+        """Roll out the actor policy from a latent state for a given horizon.
+
+        Samples ``num_trajs`` stochastic trajectories and returns their mean.
+
+        Args:
+            z: Initial latent state of shape ``(B, latent_dim)``.
+            horizon: Number of steps to unroll.
+            num_trajs: Number of independent trajectories to average.
+
+        Returns:
+            Mean action sequence of shape ``(B, horizon, action_dim)``.
+        """
+        trajs = []
+        for _ in range(num_trajs):
+            curr_z, traj = z, []
+            for _ in range(horizon):
+                mean_raw, log_std_raw = self.pi(curr_z).chunk(2, dim=-1)
+                act = torch.tanh(
+                    mean_raw
+                    + log_std_raw.clamp(-10, 2).exp()
+                    * torch.randn_like(mean_raw)
+                )
+                traj.append(act)
+                curr_z = self.dynamics(torch.cat([curr_z, act], dim=-1))
+            trajs.append(torch.stack(traj, dim=1))  # (B, horizon, action_dim)
+        return torch.stack(trajs).mean(0)  # (B, horizon, action_dim)
+
+    def get_action(self, info_dict: dict, horizon: int = 1) -> torch.Tensor:
+        """Sample an action sequence from the actor policy via latent rollout.
+
+        Encodes the current observation/goal into a latent state, then calls
+        :meth:`rollout` for ``horizon`` steps.
+
+        Args:
+            info_dict: Dictionary containing environment state information with
+                shape ``(B, ...)``.
+            horizon: Number of steps to plan. Returns shape ``(B, action_dim)``
+                when 1, or ``(B, horizon, action_dim)`` when > 1.
+
+        Returns:
+            Action tensor of shape ``(B, action_dim)`` or ``(B, horizon, action_dim)``.
+        """
+        device = next(self.parameters()).device
+        encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
+
+        obs_dict, goal_dict = {}, {}
+        for key in encoding_keys:
+            obs = info_dict[key].to(device)
+            goal_key = f'goal_{key}' if f'goal_{key}' in info_dict else 'goal'
+            goal = info_dict[goal_key].to(device)
+            if key != 'pixels' and obs.ndim >= 3:
+                obs = obs[..., -1, :]
+                goal = goal[..., -1, :]
+            obs_dict[key] = obs
+            goal_dict[key] = goal
+
+        z = self.encode(obs_dict, goal_dict)  # (B, latent_dim)
+        num_trajs = self.cfg.wm.get('num_pi_trajs', 1)
+        actions = self.rollout(
+            z, horizon, num_trajs
+        )  # (B, horizon, action_dim)
+
+        if horizon == 1:
+            return actions[:, 0]  # (B, action_dim)
+        return actions
+
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
         """
         Evaluates the cost of candidate action trajectories.
