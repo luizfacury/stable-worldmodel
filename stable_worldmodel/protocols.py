@@ -68,7 +68,10 @@ class Actionable(Protocol):
     """Protocol for model action computation."""
 
     def get_action(
-        self, info: dict, horizon: int = 1
+        self,
+        info: dict,
+        horizon: int = 1,
+        prefix_actions: torch.Tensor | None = None,
     ) -> torch.Tensor:  # pragma: no cover
         """Compute action(s) from observation and goal.
 
@@ -77,6 +80,10 @@ class Actionable(Protocol):
             horizon: Number of actions to return. When 1 (default), returns a
                 single action of shape (..., action_dim). When > 1, returns an
                 action sequence of shape (..., horizon, action_dim).
+            prefix_actions: Optional warm-start actions of shape
+                ``(..., t, action_dim)`` with ``t < horizon`` that are applied
+                first to advance the latent state before the actor is rolled
+                out for ``horizon`` steps.
 
         Returns:
             A tensor of actions with shape (..., action_dim) if horizon == 1,

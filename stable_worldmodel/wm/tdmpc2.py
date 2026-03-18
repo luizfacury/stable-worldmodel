@@ -293,17 +293,26 @@ class TDMPC2(nn.Module):
             trajs.append(torch.stack(traj, dim=1))  # (B, horizon, action_dim)
         return torch.stack(trajs).mean(0)  # (B, horizon, action_dim)
 
-    def get_action(self, info_dict: dict, horizon: int = 1) -> torch.Tensor:
+    def get_action(
+        self,
+        info_dict: dict,
+        horizon: int = 1,
+        prefix_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Sample an action sequence from the actor policy via latent rollout.
 
-        Encodes the current observation/goal into a latent state, then calls
-        :meth:`rollout` for ``horizon`` steps.
+        Encodes the current observation/goal into a latent state, optionally
+        advances it through ``prefix_actions`` via the dynamics model, then
+        calls :meth:`rollout` for ``horizon`` steps.
 
         Args:
             info_dict: Dictionary containing environment state information with
                 shape ``(B, ...)``.
             horizon: Number of steps to plan. Returns shape ``(B, action_dim)``
                 when 1, or ``(B, horizon, action_dim)`` when > 1.
+            prefix_actions: Optional warm-start actions of shape
+                ``(B, t, action_dim)`` with ``t < horizon``. The latent state
+                is advanced through these steps before the actor rollout.
 
         Returns:
             Action tensor of shape ``(B, action_dim)`` or ``(B, horizon, action_dim)``.
@@ -323,6 +332,13 @@ class TDMPC2(nn.Module):
             goal_dict[key] = goal
 
         z = self.encode(obs_dict, goal_dict)  # (B, latent_dim)
+
+        if prefix_actions is not None:
+            for t in range(prefix_actions.shape[1]):
+                z = self.dynamics(
+                    torch.cat([z, prefix_actions[:, t].to(device)], dim=-1)
+                )
+
         num_trajs = self.cfg.wm.get('num_pi_trajs', 1)
         actions = self.rollout(
             z, horizon, num_trajs

@@ -14,7 +14,10 @@ def build_init_action(
     """Extend or generate an initial action sequence using the model's actor.
 
     When the model implements the Actionable protocol, this function fills
-    any missing planning steps by calling ``model.get_action(info_dict, horizon=remaining)``.
+    any missing planning steps by calling
+    ``model.get_action(info_dict, horizon=remaining, prefix_actions=init_action)``,
+    so the actor is rolled out from the latent state reached after applying
+    the existing warm-start actions.
     If ``init_action`` already covers the full horizon it is returned unchanged.
     If the model is not Actionable, ``init_action`` is returned as-is (which may be None).
 
@@ -39,10 +42,10 @@ def build_init_action(
     if remaining <= 0:
         return init_action
 
-    # TODO there is an issue, the actor should be rolled out from the state obtained after applying the init_action, not from the current state. This is because the actor may be stateful and the state after applying the init_action may be different from the current state.
-
     with torch.no_grad():
-        tail = model.get_action(info_dict, horizon=remaining)
+        tail = model.get_action(
+            info_dict, horizon=remaining, prefix_actions=init_action
+        )
         # tail: (n_envs, remaining, action_dim)
 
     if init_action is not None:
