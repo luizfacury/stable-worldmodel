@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from gymnasium.spaces import Box
 from loguru import logger as logging
 
-from .solver import Costable
+from stable_worldmodel.protocols import Costable
 
 
 class LagrangianSolver(torch.nn.Module):
