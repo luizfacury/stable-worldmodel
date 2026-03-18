@@ -601,7 +601,7 @@ class MockActionableCostableModel(torch.nn.Module):
 
 
 class MockSolverWithWarmStart:
-    """Mock solver that calls build_init_action exactly as real solvers do."""
+    """Mock solver that calls prepare_init_action exactly as real solvers do."""
 
     def __init__(self, model):
         self.model = model
@@ -626,10 +626,15 @@ class MockSolverWithWarmStart:
         return self._config.horizon
 
     def solve(self, info_dict: dict, init_action=None) -> dict:
-        from stable_worldmodel.solver.utils import build_init_action
+        from stable_worldmodel.solver.utils import prepare_init_action
 
-        init_action = build_init_action(
-            self.model, info_dict, init_action, self.horizon
+        init_action = prepare_init_action(
+            self.model,
+            info_dict,
+            init_action,
+            self.horizon,
+            n_envs=self.n_envs,
+            action_dim=self.action_dim,
         )
         self.received_init_action = init_action
         return {

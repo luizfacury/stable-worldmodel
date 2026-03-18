@@ -10,7 +10,7 @@ from gymnasium.spaces import Box
 from loguru import logger as logging
 
 from stable_worldmodel.protocols import Costable
-from stable_worldmodel.solver.utils import build_init_action
+from stable_worldmodel.solver.utils import prepare_init_action
 
 
 class MPPISolver:
@@ -85,25 +85,17 @@ class MPPISolver:
         return self.solve(*args, **kwargs)
 
     def init_action_distrib(
-        self, actions: torch.Tensor | None = None
+        self, actions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Initialize the action distribution parameters (mean and variance)."""
+        assert actions.shape == (self.n_envs, self.horizon, self.action_dim), (
+            f'Expected actions shape ({self.n_envs}, {self.horizon}, {self.action_dim}), '
+            f'got {tuple(actions.shape)}'
+        )
         var = self.var_scale * torch.ones(
             [self.n_envs, self.horizon, self.action_dim]
         )
-        mean = (
-            torch.zeros([self.n_envs, 0, self.action_dim])
-            if actions is None
-            else actions
-        )
-
-        remaining = self.horizon - mean.shape[1]
-        if remaining > 0:
-            device = mean.device
-            new_mean = torch.zeros([self.n_envs, remaining, self.action_dim])
-            mean = torch.cat([mean, new_mean], dim=1).to(device)
-
-        return mean, var
+        return actions, var
 
     @torch.inference_mode()
     def solve(
@@ -117,9 +109,14 @@ class MPPISolver:
             'var': [],
         }
 
-        # -- warm-start from actor if model is Actionable
-        init_action = build_init_action(
-            self.model, info_dict, init_action, self.horizon
+        # -- warm-start from actor if model is Actionable, else zero-pad
+        init_action = prepare_init_action(
+            self.model,
+            info_dict,
+            init_action,
+            self.horizon,
+            n_envs=self.n_envs,
+            action_dim=self.action_dim,
         )
 
         # -- initialize the action distribution globally
