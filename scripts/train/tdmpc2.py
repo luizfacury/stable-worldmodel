@@ -15,7 +15,6 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 
-
 from stable_worldmodel.wm.tdmpc2 import (
     TDMPC2,
     two_hot,
@@ -53,10 +52,6 @@ def tdmpc2_forward(self, batch, stage, cfg):
     """
     Executes the forward pass and loss computation for the TD-MPC2 world model and policy.
 
-    This function dynamically extracts encoded modalities, unrolls the latent dynamics over a
-    fixed horizon, and computes the consistency, reward, and Q-value losses. It also performs
-    the actor policy update using a conservative Q-value estimate to prevent out-of-distribution actions.
-
     Args:
         batch (dict): Dictionary containing environment observations, actions, and rewards.
         stage (str): The current execution stage (e.g., 'train', 'validate').
@@ -69,23 +64,11 @@ def tdmpc2_forward(self, batch, stage, cfg):
     B, T_plus_1 = batch['action'].shape[:2]
 
     flat_obs_dict = {}
-    flat_goal_dict = {}
-
     for key in encoding_keys:
         obs = batch[key]
-        goal = batch[f'goal_{key}']
-
-        if goal.ndim == obs.ndim and goal.shape[1] == 1:
-            goal = goal.expand(-1, T_plus_1, *([-1] * (goal.ndim - 2)))
-        elif goal.ndim == obs.ndim - 1:
-            goal = goal.unsqueeze(1).expand(
-                -1, T_plus_1, *([-1] * (goal.ndim - 1))
-            )
-
         flat_obs_dict[key] = obs.reshape(-1, *obs.shape[2:])
-        flat_goal_dict[key] = goal.reshape(-1, *goal.shape[2:])
 
-    all_z = self.model.encode(flat_obs_dict, flat_goal_dict).reshape(
+    all_z = self.model.encode(flat_obs_dict).reshape(
         B, T_plus_1, -1
     )
 
@@ -142,22 +125,25 @@ def tdmpc2_forward(self, batch, stage, cfg):
         log_std_bounded = log_std(log_std_raw, low=-10, dif=12)
         eps = torch.randn_like(mean_raw)
         log_prob = gaussian_logprob(eps, log_std_bounded)
+        scaled_log_prob = log_prob * cfg.action_dim
+
         action_pi_raw = mean_raw + eps * log_std_bounded.exp()
         mu, action_pi, log_prob = squash(mean_raw, action_pi_raw, log_prob)
 
-        scaled_log_prob = log_prob * cfg.action_dim
         entropy_scale = scaled_log_prob / (log_prob + 1e-8)
         scaled_entropy = -log_prob * entropy_scale
 
         z_pi = torch.cat([z_detached, action_pi], dim=-1)
-        self.model.qs.requires_grad_(False)
-        qs_pi = torch.stack(
-            [two_hot_inv(q(z_pi), cfg) for q in self.model.qs], dim=0
-        )
+        try:
+            self.model.qs.requires_grad_(False)
+            qs_pi = torch.stack(
+                [two_hot_inv(q(z_pi), cfg) for q in self.model.qs], dim=0
+            )
+        finally:
+            self.model.qs.requires_grad_(True)
 
         q_indices = random.sample(range(cfg.wm.num_q), 2)
         q_pi_avg = (qs_pi[q_indices[0]] + qs_pi[q_indices[1]]) / 2.0
-        self.model.qs.requires_grad_(True)
 
         if t == 0:
             self.model.scale.update(q_pi_avg)
@@ -189,7 +175,7 @@ def tdmpc2_forward(self, batch, stage, cfg):
             f'{stage}/policy': loss_pi,
         },
         on_step=True,
-        sync_dist=True,
+        sync_dist=False,
         prog_bar=True,
     )
 
@@ -250,14 +236,13 @@ def get_img_preprocessor(source, target, img_size=64):
     )
 
 
+
 @hydra.main(version_base=None, config_path='./config', config_name='tdmpc2')
 def run(cfg):
     """
     Main training entry point for the TD-MPC2 model.
 
-    Dynamically structures the dataset and applies transforms/normalizers based on the available
-    modalities defined in the configuration (e.g., pixels, state arrays). Initializes the TD-MPC2
-    architecture and orchestrates the PyTorch Lightning training loop.
+    Uses dataset rewards directly.
 
     Args:
         cfg (DictConfig): Hydra configuration object.
@@ -313,23 +298,7 @@ def run(cfg):
 
     base_dataset.transform = spt.data.transforms.Compose(*transforms)
 
-    goal_keys = {key: f'goal_{key}' for key in encoding_keys}
-    if use_pixels:
-        goal_keys['pixels'] = 'goal_pixels'
-    goal_probs = (
-        cfg.goal_probabilities.random,
-        cfg.goal_probabilities.geometric_future,
-        cfg.goal_probabilities.uniform_future,
-        cfg.goal_probabilities.current,
-    )
-
-    dataset = swm.data.GoalDataset(
-        dataset=base_dataset,
-        goal_probabilities=goal_probs,
-        current_goal_offset=cfg.wm.horizon + 1,
-        goal_keys=goal_keys,
-        seed=cfg.seed,
-    )
+    dataset = base_dataset
 
     train_set, val_set = spt.data.random_split(
         dataset, [cfg.train_split, 1 - cfg.train_split]
@@ -339,9 +308,12 @@ def run(cfg):
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
+        pin_memory=True,
+        persistent_workers=True
     )
     val_loader = DataLoader(
-        val_set, batch_size=cfg.batch_size, num_workers=cfg.num_workers
+        val_set, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        pin_memory=True, persistent_workers=True
     )
 
     model = TDMPC2(cfg)
@@ -377,7 +349,7 @@ def run(cfg):
     logger = None
     if cfg.wandb.enable:
         logger = WandbLogger(
-            name='tdmpc2',
+            name=f'{cfg.wm.name}_{cfg.dataset_name}_{subdir}',
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             resume='allow' if subdir else None,

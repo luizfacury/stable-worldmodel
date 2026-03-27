@@ -88,12 +88,17 @@ class SimNorm(nn.Module):
 
 
 class NormedLinear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, dropout=0., act=None):
         super().__init__(in_features, out_features, bias=bias)
         self.ln = nn.LayerNorm(out_features)
+        self.act = act if act is not None else nn.Mish()
+        self.dropout = nn.Dropout(dropout, inplace=False) if dropout else None
 
     def forward(self, x):
-        return F.mish(self.ln(super().forward(x)))
+        x = super().forward(x)
+        if self.dropout:
+            x = self.dropout(x)
+        return self.act(self.ln(x))
 
 
 class RunningScale(nn.Module):
@@ -117,20 +122,47 @@ class RunningScale(nn.Module):
         return x / self.value
 
 
-def mlp(in_dim, mlp_dim, out_dim, dropout=0.0):
+def mlp(in_dim, mlp_dim, out_dim, act=None, dropout=0.0):
     layers = [
-        NormedLinear(in_dim, mlp_dim),
-        nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+        NormedLinear(in_dim, mlp_dim, dropout=dropout),
         NormedLinear(mlp_dim, mlp_dim),
-        nn.Linear(mlp_dim, out_dim),
     ]
+    if act is not None:
+        layers.append(NormedLinear(mlp_dim, out_dim, act=act))
+    else:
+        layers.append(nn.Linear(mlp_dim, out_dim))
     return nn.Sequential(*layers)
+
+
+def weight_init(m):
+    """Custom weight initialization for TD-MPC2."""
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
+
+def zero_init(params):
+    """Zero-initialize specific parameters."""
+    for p in params:
+        if p is not None:
+            p.data.fill_(0)
 
 
 class TDMPC2(nn.Module):
     """
     Main Neural Network Architecture for TD-MPC2.
     Handles dynamic encoding of modalities, latent dynamics, reward prediction, and action planning.
+
+    Encoder takes observations only.
+
+    Args:
+        cfg: Configuration object containing model and training hyperparameters.
+        extra_encoders: Optional pre-built ModuleDict of observation encoders.
+            If provided, these are used directly instead of building default MLP
+            encoders from cfg. Allows injecting custom encoder architectures
+            (e.g. CNNs, transformers) without modifying this class.
+            Output dims must match cfg.wm.encoding values.
 
     Assumptions:
         - Continuous Control: The algorithm assumes continuous action spaces.
@@ -140,19 +172,18 @@ class TDMPC2(nn.Module):
             [vmin, vmax] range defined in the config, as they are discretized using two-hot encoding.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, extra_encoders: nn.ModuleDict | None = None):
         super().__init__()
         self.cfg = cfg
         self.scale = RunningScale(cfg.wm.tau)
 
-        # Determine modalities directly from the encoding dict
         encoding_cfg = cfg.wm.get('encoding', {})
         self.use_pixels = 'pixels' in encoding_cfg
         self.latent_dim = 0
 
         if self.use_pixels:
             self.cnn = nn.Sequential(
-                nn.Conv2d(6, 32, 7, stride=2),
+                nn.Conv2d(3, 32, 7, stride=2),
                 nn.Mish(),
                 nn.Conv2d(32, 32, 5, stride=2),
                 nn.Mish(),
@@ -163,24 +194,32 @@ class TDMPC2(nn.Module):
                 nn.Flatten(),
             )
             with torch.no_grad():
-                dummy = torch.zeros(1, 6, cfg.image_size, cfg.image_size)
+                dummy = torch.zeros(1, 3, cfg.image_size, cfg.image_size)
                 cnn_out_dim = self.cnn(dummy).shape[1]
 
             pixel_dim = encoding_cfg['pixels']
             self.pixel_encoder = nn.Linear(cnn_out_dim, pixel_dim)
             self.latent_dim += pixel_dim
 
-        self.extra_encoders = nn.ModuleDict()
-        for key, out_dim in encoding_cfg.items():
-            if key == 'pixels':
-                continue  # Handled by primary backbone
+        if extra_encoders is not None:
+            self.extra_encoders = extra_encoders
+        else:
+            # Default: build a two-layer MLP encoder for each non-pixel modality
+            self.extra_encoders = nn.ModuleDict()
+            for key, out_dim in encoding_cfg.items():
+                if key == 'pixels':
+                    continue
+                in_dim = cfg.extra_dims[key]
+                self.extra_encoders[key] = nn.Sequential(
+                    NormedLinear(in_dim, cfg.wm.enc_dim),
+                    nn.Linear(cfg.wm.enc_dim, out_dim),
+                    nn.LayerNorm(out_dim),
+                )
 
-            in_dim = cfg.extra_dims[key] * 2
-            self.extra_encoders[key] = nn.Sequential(
-                NormedLinear(in_dim, cfg.wm.enc_dim),
-                NormedLinear(cfg.wm.enc_dim, out_dim),
-            )
-            self.latent_dim += out_dim
+        # Accumulate latent dim from all non-pixel encoders
+        for key, out_dim in encoding_cfg.items():
+            if key != 'pixels':
+                self.latent_dim += out_dim
 
         assert self.latent_dim > 0, (
             'Model must have pixels or at least one extra_encoder defined.'
@@ -188,17 +227,23 @@ class TDMPC2(nn.Module):
 
         self.sim_norm = SimNorm(cfg)
 
-        self.dynamics = nn.Sequential(
-            NormedLinear(self.latent_dim + cfg.action_dim, cfg.wm.mlp_dim),
-            NormedLinear(cfg.wm.mlp_dim, cfg.wm.mlp_dim),
-            NormedLinear(cfg.wm.mlp_dim, self.latent_dim),
-            SimNorm(cfg),
+        # Latent dynamics model: predicts next latent state z' from (z, a)
+        self.dynamics = mlp(
+            self.latent_dim + cfg.action_dim, cfg.wm.mlp_dim,
+            self.latent_dim, act=SimNorm(cfg),
         )
+
+        # Reward predictor: predicts expected reward from (z, a) as a two-hot distribution
         self.reward = mlp(
             self.latent_dim + cfg.action_dim, cfg.wm.mlp_dim, cfg.wm.num_bins
         )
+
+        # Policy prior (actor): outputs (mean, log_std) of a Gaussian over actions given z.
+        # Used both to compute the policy loss and to warm-start CEM planning.
         self.pi = mlp(self.latent_dim, cfg.wm.mlp_dim, 2 * cfg.action_dim)
 
+        # Ensemble of Q-functions: each predicts action-value from (z, a) as a two-hot
+        # distribution. An ensemble is used for clipped double-Q to reduce overestimation.
         self.qs = nn.ModuleList(
             [
                 mlp(
@@ -214,51 +259,69 @@ class TDMPC2(nn.Module):
         for p in self.target_qs.parameters():
             p.requires_grad = False
 
-    def encode(self, obs_dict, goal_dict):
-        """
-        Encodes primary vision and extra modalities separately, then concatenates them into a single latent state.
+        # Weight initialization (matches official TD-MPC2)
+        self.apply(weight_init)
+        zero_init([self.reward[-1].weight])
+        for q in self.qs:
+            zero_init([q[-1].weight])
+        for q in self.target_qs:
+            zero_init([q[-1].weight])
+
+    def encode(self, obs_dict: dict) -> torch.Tensor:
+        """Encode observations into a SimNorm-normalized latent state.
+
+        Handles any number of leading dimensions without ndim checks, following
+        the DINO-WM convention where the encoder owns the reshaping and callers
+        pass observations as-is:
+
+        - (B, dim)       → (B, latent_dim)          single-step inference
+        - (B, T, dim)    → (B, T, latent_dim)        offline training sequence
+        - (B, N, dim)    → (B, N, latent_dim)        CEM candidate expansion
 
         Args:
-            obs_dict (dict): Dictionary of current observations (e.g., 'pixels', 'state').
-            goal_dict (dict): Dictionary of goal observations.
+            obs_dict: Dictionary of observations with any leading shape.
 
         Returns:
-            torch.Tensor: The SimNorm-regularized latent representation of shape (B, latent_dim).
+            SimNorm-regularized latent state preserving all leading dimensions.
         """
         embeddings = []
         target_dtype = next(self.parameters()).dtype
 
-        # Process Primary Vision
+        # Process primary vision modality — flatten all leading dims into batch
         if self.use_pixels:
             obs = obs_dict['pixels'].to(target_dtype)
-            goal = goal_dict['pixels'].to(target_dtype)
-
             if obs.shape[-1] == 3:
                 obs = obs.movedim(-1, -3)
-                goal = goal.movedim(-1, -3)
-            lead_dims = obs.shape[:-3]
-            obs_flat = obs.reshape(-1, *obs.shape[-3:])
-            goal_flat = goal.reshape(-1, *goal.shape[-3:])
-
-            x_g = torch.cat([obs_flat, goal_flat], dim=-3)
-            cnn_out = self.cnn(x_g)
-            z_pixels = self.pixel_encoder(cnn_out).view(*lead_dims, -1)
+            lead_dims = obs.shape[:-3]                      # e.g. (B,) or (B, T)
+            obs_flat  = obs.reshape(-1, *obs.shape[-3:])    # (prod(lead), C, H, W)
+            cnn_out   = self.cnn(obs_flat)
+            z_pixels  = self.pixel_encoder(cnn_out).view(*lead_dims, -1)
             embeddings.append(z_pixels)
 
-        # Process Extra Modalities (States, Proprio, etc.)
+        # Process extra modalities (state, proprioception, etc.)
         for key, encoder in self.extra_encoders.items():
-            obs = obs_dict[key].to(target_dtype)
-            goal = goal_dict[key].to(target_dtype)
-            x_g = torch.cat([obs, goal], dim=-1)
-            z_extra = encoder(x_g)
-            embeddings.append(z_extra)
+            obs      = obs_dict[key].to(target_dtype)       # (*lead, dim)
+            lead     = obs.shape[:-1]
+            obs_flat = obs.reshape(-1, obs.shape[-1])       # (prod(lead), dim)
+            z        = encoder(obs_flat).view(*lead, -1)    # (*lead, enc_dim)
+            embeddings.append(z)
 
         z_concat = torch.cat(embeddings, dim=-1)
         return self.sim_norm(z_concat)
 
-    def forward(self, z, action):
-        """
-        Predicts the next latent state and expected reward given the current latent state and action.
+    def forward(self, z: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """One-step world model prediction.
+
+        Given a latent state and action, predicts the next latent state via the
+        dynamics model and the expected reward as a two-hot logit vector.
+
+        Args:
+            z: Current latent state of shape (B, latent_dim).
+            action: Action of shape (B, action_dim).
+
+        Returns:
+            Tuple of (next_z, reward_logits) with shapes (B, latent_dim) and
+            (B, num_bins) respectively.
         """
         z_a = torch.cat([z, action], dim=-1)
         return self.dynamics(z_a), self.reward(z_a)
@@ -271,12 +334,12 @@ class TDMPC2(nn.Module):
         Samples ``num_trajs`` stochastic trajectories and returns their mean.
 
         Args:
-            z: Initial latent state of shape ``(B, latent_dim)``.
+            z: Initial latent state of shape (B, latent_dim).
             horizon: Number of steps to unroll.
             num_trajs: Number of independent trajectories to average.
 
         Returns:
-            Mean action sequence of shape ``(B, horizon, action_dim)``.
+            Mean action sequence of shape (B, horizon, action_dim).
         """
         trajs = []
         for _ in range(num_trajs):
@@ -285,13 +348,13 @@ class TDMPC2(nn.Module):
                 mean_raw, log_std_raw = self.pi(curr_z).chunk(2, dim=-1)
                 act = torch.tanh(
                     mean_raw
-                    + log_std_raw.clamp(-10, 2).exp()
+                    + log_std(log_std_raw, low=-10, dif=12).exp()
                     * torch.randn_like(mean_raw)
                 )
                 traj.append(act)
                 curr_z = self.dynamics(torch.cat([curr_z, act], dim=-1))
             trajs.append(torch.stack(traj, dim=1))  # (B, horizon, action_dim)
-        return torch.stack(trajs).mean(0)  # (B, horizon, action_dim)
+        return torch.stack(trajs).mean(0)            # (B, horizon, action_dim)
 
     def get_action(
         self,
@@ -301,37 +364,26 @@ class TDMPC2(nn.Module):
     ) -> torch.Tensor:
         """Sample an action sequence from the actor policy via latent rollout.
 
-        Encodes the current observation/goal into a latent state, optionally
-        advances it through ``prefix_actions`` via the dynamics model, then
-        calls :meth:`rollout` for ``horizon`` steps.
+        Encodes the current observation into a latent state, optionally advances
+        it through ``prefix_actions`` via the dynamics model, then calls
+        ``rollout`` for ``horizon`` steps.
 
         Args:
             info_dict: Dictionary containing environment state information with
-                shape ``(B, ...)``.
-            horizon: Number of steps to plan. Returns shape ``(B, action_dim)``
-                when 1, or ``(B, horizon, action_dim)`` when > 1.
+                shape (B, ...).
+            horizon: Number of steps to plan.
             prefix_actions: Optional warm-start actions of shape
-                ``(B, t, action_dim)`` with ``t < horizon``. The latent state
-                is advanced through these steps before the actor rollout.
+                (B, t, action_dim) with t < horizon. The latent state is
+                advanced through these steps before the actor rollout.
 
         Returns:
-            Action tensor of shape ``(B, action_dim)`` or ``(B, horizon, action_dim)``.
+            Action tensor of shape (B, horizon, action_dim).
         """
         device = next(self.parameters()).device
         encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
 
-        obs_dict, goal_dict = {}, {}
-        for key in encoding_keys:
-            obs = info_dict[key].to(device)
-            goal_key = f'goal_{key}' if f'goal_{key}' in info_dict else 'goal'
-            goal = info_dict[goal_key].to(device)
-            if key != 'pixels' and obs.ndim >= 3:
-                obs = obs[..., -1, :]
-                goal = goal[..., -1, :]
-            obs_dict[key] = obs
-            goal_dict[key] = goal
-
-        z = self.encode(obs_dict, goal_dict)  # (B, latent_dim)
+        obs_dict = {key: info_dict[key].to(device) for key in encoding_keys}
+        z = self.encode(obs_dict)
 
         if prefix_actions is not None:
             for t in range(prefix_actions.shape[1]):
@@ -340,49 +392,27 @@ class TDMPC2(nn.Module):
                 )
 
         num_trajs = self.cfg.wm.get('num_pi_trajs', 1)
-        actions = self.rollout(
-            z, horizon, num_trajs
-        )  # (B, horizon, action_dim)
+        return self.rollout(z, horizon, num_trajs)  # (B, horizon, action_dim)
 
-        if horizon == 1:
-            return actions[:, 0]  # (B, action_dim)
-        return actions
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
+        """Evaluate the cost of candidate action trajectories.
 
-    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
-        """
-        Evaluates the cost of candidate action trajectories.
+        Rolls out the world model for each candidate, accumulates discounted
+        rewards, and adds a terminal value estimate with an optional uncertainty
+        penalty to favour conservative planning.
+
+        Args:
+            info_dict: Dictionary containing environment state with shape (B, N, ...).
+            action_candidates: Candidate action sequences of shape (B, N, H, A).
+
+        Returns:
+            Cost tensor of shape (B, N). Lower is better.
         """
         device = action_candidates.device
         encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
 
-        obs_dict = {}
-        goal_dict = {}
-
-        for key in encoding_keys:
-            obs = info_dict[key].to(device)
-
-            eval_goal_key = f'goal_{key}'
-            if eval_goal_key not in info_dict and 'goal' in info_dict:
-                eval_goal_key = 'goal'
-            goal = info_dict[eval_goal_key].to(device)
-
-            if key != 'pixels':
-                if obs.ndim >= 3:
-                    obs = obs[..., -1, :]
-                if goal.ndim >= 3:
-                    goal = goal[..., -1, :]
-            else:
-                if (
-                    obs.ndim >= 5
-                ):  # e.g., (B, T, C, H, W) or (B, N, T, C, H, W)
-                    obs = obs[..., -1, :, :, :]
-                if goal.ndim >= 5:
-                    goal = goal[..., -1, :, :, :]
-
-            obs_dict[key] = obs
-            goal_dict[key] = goal
-
-        z = self.encode(obs_dict, goal_dict)
+        obs_dict = {key: info_dict[key].to(device) for key in encoding_keys}
+        z = self.encode(obs_dict)
 
         B, N, H, A = action_candidates.shape
 
@@ -399,16 +429,12 @@ class TDMPC2(nn.Module):
 
         G, discount = 0, 1.0
         c = self.cfg.wm.get('uncertainty_penalty', 0.5)
-
-        termination = torch.zeros(
-            B * N, 1, dtype=torch.float32, device=z.device
-        )
+        termination = torch.zeros(B * N, 1, dtype=torch.float32, device=z.device)
 
         for t in range(H):
             z_a = torch.cat([z, actions[:, t]], dim=-1)
             reward = two_hot_inv(self.reward(z_a), self.cfg)
             z = self.dynamics(z_a)
-
             G = G + discount * (1 - termination) * reward
             discount = discount * self.cfg.wm.get('discount', 0.99)
 
@@ -417,17 +443,13 @@ class TDMPC2(nn.Module):
         z_a_term = torch.cat([z, action], dim=-1)
 
         q_logits = torch.stack([q(z_a_term) for q in self.qs])
-        q_values = torch.stack(
-            [two_hot_inv(logits, self.cfg) for logits in q_logits]
-        )
+        q_values  = torch.stack([two_hot_inv(logits, self.cfg) for logits in q_logits])
 
         q_mean = q_values.mean(dim=0)
-        q_std = q_values.std(dim=0)
+        q_std  = q_values.std(dim=0)
 
-        penalty = c * q_mean.abs() * q_std
+        penalty        = c * q_mean.abs() * q_std
         conservative_q = q_mean - penalty
+        total_return   = G + discount * (1 - termination) * conservative_q
 
-        total_return = G + discount * (1 - termination) * conservative_q
-
-        cost = -total_return.view(B, N)
-        return cost
+        return -total_return.view(B, N)

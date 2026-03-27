@@ -356,8 +356,6 @@ class WorldModelPolicy(BasePolicy):
             The selected action(s) as a numpy array.
         """
         assert hasattr(self, 'env'), 'Environment not set for the policy'
-        assert 'pixels' in info_dict, "'pixels' must be provided in info_dict"
-        assert 'goal' in info_dict, "'goal' must be provided in info_dict"
 
         info_dict = self._prepare_info(info_dict)
 
