@@ -1,0 +1,112 @@
+defaults:
+  - _self_
+  - launcher: local
+
+hydra:
+  job:
+    chdir: true
+
+# --- Run ---
+output_model_name: dreamer4_${wm.phase}
+subdir: mae_05
+seed: 42
+
+# --- Data ---
+dataset_name: pusht_expert_train_v2
+cache_dir: null
+image_size: 128
+
+batch_size: 4
+num_workers: 8
+train_split: 0.9
+frameskip: 5
+
+# --- World model ---
+wm:
+  # Training phase: "tokenizer" or "dynamics"
+  phase: tokenizer
+
+  # Sequence length for dynamics training (obs horizon, not counting initial frame)
+  horizon: 16
+
+  # Image patching
+  patch: 4
+
+  # ── Tokenizer architecture ─────────────────────────────────────
+  d_model_tok: 256
+  n_heads_tok: 4
+  depth_tok: 8
+  n_latents: 32
+  d_bottleneck: 64
+  time_every_tok: 1
+
+  # MAE masking (only active during tokenizer training)
+  mae_p_min: 0.0
+  mae_p_max: 0.05
+
+  # LPIPS perceptual loss (paper eq. 5: L = L_MSE + 0.2 * L_LPIPS)
+  lpips_weight: 1.0        # set to 0 to disable; requires: pip install lpips
+  lpips_frac: 0.5           # subsample fraction of frames for LPIPS (saves memory)
+  lpips_net: alex            # LPIPS backbone: "alex", "vgg", or "squeeze"
+
+  # ── Dynamics architecture ──────────────────────────────────────
+  d_model_dyn: 512
+  n_heads_dyn: 4
+  depth_dyn: 8
+  time_every_dyn: 4
+  packing_factor: 2
+  n_register: 4
+  n_agent: 0
+  space_mode: wm_agent_isolated
+
+  # ── Shared architecture ────────────────────────────────────────
+  dropout: 0.0
+  mlp_ratio: 4.0
+  scale_pos_embeds: false
+
+  # ── Shortcut forcing ───────────────────────────────────────────
+  k_max: 8                  # max Euler steps (must be power of 2)
+  self_fraction: 0.25       # batch fraction for bootstrap loss
+  bootstrap: true           # enable self-consistency (bootstrap) loss
+  schedule: shortcut        # "shortcut" or "finest"
+  eval_d: 0.25              # step size at inference (1/K sampling steps)
+
+  # ── Reward head ────────────────────────────────────────────────
+  mlp_dim: 256
+  num_bins: 101
+  vmin: -4
+  vmax: 0
+  reward_coef: 1.0
+  discount: 0.99
+
+  # ── Encoding modalities (keys loaded from dataset) ─────────────
+  # 'pixels' is always loaded; list extra modalities here with their dims
+  encoding:
+    pixels: 0   # pixel dim is inferred, value here is a
+
+  # ── Phase 2: pretrained tokenizer checkpoint ───────────────────
+  tokenizer_ckpt: /snfs2/luizfacury/datasets/1/dreamer4_tokenizer_epoch_3_object.ckpt
+
+# --- Optimizer ---
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-2
+
+# --- Trainer ---
+trainer:
+  max_epochs: 5
+  strategy: ddp
+  devices: auto
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+
+# --- Logging ---
+wandb:
+  enable: false
+  project: swm-dreamer4
+  entity: null
+
+dump_object: true
