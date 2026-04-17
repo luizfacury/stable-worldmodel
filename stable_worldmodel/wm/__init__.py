@@ -1,6 +1,7 @@
-from . import gcrl, prejepa
-from .prejepa import PreJEPA
-from .gcrl import GCRL
-from .tdmpc2 import TDMPC2
+from .loss import *  # noqa: F403
+from .utils import *  # noqa: F403
 
-__all__ = ['prejepa', 'PreJEPA', 'gcrl', 'GCRL', 'tdmpc2', 'TDMPC2']
+# Baselines
+from .gcrl import *  # noqa: F403
+from .prejepa import *  # noqa: F403
+from .lewm import *  # noqa: F403
