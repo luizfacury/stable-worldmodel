@@ -8,7 +8,7 @@ hydra:
 
 # --- Run ---
 output_model_name: dreamer4_${wm.phase}
-subdir: mae_05
+subdir: dynamics_complete
 seed: 42
 
 # --- Data ---
@@ -16,96 +16,116 @@ dataset_name: pusht_expert_train_v2
 cache_dir: null
 image_size: 128
 
-batch_size: 4
-num_workers: 8
-train_split: 0.9
-frameskip: 5
+batch_size: 20
+num_workers: 4
+train_split: 1.0
+frameskip: 1
 
 # --- World model ---
 wm:
-  # Training phase: "tokenizer" or "dynamics"
-  phase: tokenizer
-
-  # Sequence length for dynamics training (obs horizon, not counting initial frame)
-  horizon: 16
-
-  # Image patching
+  phase: dynamics       # tokenizer | dynamics | agent_finetune
+  horizon: 32
   patch: 4
 
-  # ── Tokenizer architecture ─────────────────────────────────────
+  # ── Tokenizer architecture (must match trained checkpoint!) ───
   d_model_tok: 256
   n_heads_tok: 4
   depth_tok: 8
-  n_latents: 32
-  d_bottleneck: 64
+  n_latents: 128
+  d_bottleneck: 32
   time_every_tok: 1
 
-  # MAE masking (only active during tokenizer training)
   mae_p_min: 0.0
-  mae_p_max: 0.05
+  mae_p_max: 0.9
 
-  # LPIPS perceptual loss (paper eq. 5: L = L_MSE + 0.2 * L_LPIPS)
-  lpips_weight: 1.0        # set to 0 to disable; requires: pip install lpips
-  lpips_frac: 0.5           # subsample fraction of frames for LPIPS (saves memory)
-  lpips_net: alex            # LPIPS backbone: "alex", "vgg", or "squeeze"
+  lpips_weight: 0.2
+  lpips_frac: 0.5
+  lpips_net: alex
 
   # ── Dynamics architecture ──────────────────────────────────────
+  # IMPORTANT: every arch field below must match the dynamics checkpoint
+  # you are loading, otherwise strict=False loading will silently leave
+  # transformer weights at random init.
   d_model_dyn: 512
   n_heads_dyn: 4
+  n_kv_heads_dyn: 2          # GQA: set to e.g. 2 for 4 query heads; null = standard MHA (recommended for small models)
   depth_dyn: 8
   time_every_dyn: 4
+  qk_norm: true                # QKNorm on Q/K per head; helps at large scale, can slow convergence at small scale
   packing_factor: 2
   n_register: 4
-  n_agent: 0
+  n_agent: 1                   # was 0 in Phase 2; new agent token for Phase 3
   space_mode: wm_agent_isolated
 
-  # ── Shared architecture ────────────────────────────────────────
   dropout: 0.0
   mlp_ratio: 4.0
   scale_pos_embeds: false
 
   # ── Shortcut forcing ───────────────────────────────────────────
-  k_max: 8                  # max Euler steps (must be power of 2)
-  self_fraction: 0.25       # batch fraction for bootstrap loss
-  bootstrap: true           # enable self-consistency (bootstrap) loss
-  schedule: shortcut        # "shortcut" or "finest"
-  eval_d: 0.25              # step size at inference (1/K sampling steps)
+  k_max: 8
+  self_fraction: 0.25
+  bootstrap: true
+  schedule: shortcut
+  eval_d: 0.25
 
-  # ── Reward head ────────────────────────────────────────────────
+  # ── Task conditioning (agent_finetune only) ────────────────────
+  num_tasks: 1
+
+  # ── Context corruption (inference rollouts, paper §3.2) ───────
+  ctx_noise: 0.1               # mix fraction of Gaussian noise into past tokens
+
+  # ── Reward & policy heads ──────────────────────────────────────
   mlp_dim: 256
   num_bins: 101
-  vmin: -4
-  vmax: 0
+  vmin: -1.8                  
+  vmax: 0.1                    
+  mtp_length: 8                # L in eq. 9 of the paper
   reward_coef: 1.0
+  policy_coef: 1.0
+  policy_log_std_init: -1.0    # initial log σ for Gaussian policy (~0.37 std)
   discount: 0.99
 
-  # ── Encoding modalities (keys loaded from dataset) ─────────────
-  # 'pixels' is always loaded; list extra modalities here with their dims
   encoding:
-    pixels: 0   # pixel dim is inferred, value here is a
+    pixels: 0
 
-  # ── Phase 2: pretrained tokenizer checkpoint ───────────────────
-  tokenizer_ckpt: /snfs2/luizfacury/datasets/1/dreamer4_tokenizer_epoch_3_object.ckpt
+  # ── Checkpoints ───────────────────────────────────────────────
+  tokenizer_ckpt: /snfs2/luizfacury/datasets/weighted_95_2/dreamer4_tokenizer_epoch_5_object.ckpt
+  dynamics_ckpt: /snfs2/luizfacury/datasets/dynamics_4/dreamer4_dynamics_epoch_5_object.ckpt
+  agent_finetune_ckpt: null
+
+  # Lower LR for finetuning. If unset, falls back to optimizer.lr.
+  finetune_lr: 1.0e-4
+
+  # ── Phase 3: imagination training (paper eq. 10-11) ───────────
+  # Horizon for each imagined rollout (shorter than agent_finetune horizon to
+  # keep memory manageable; paper uses H=15).
+  imagination_horizon: 15
+  # lambda for TD lambda-returns (eq. 10); 0.95 follows standard DreamerV3 choice.
+  lambda_return: 0.95
+  # gamma for imagination discount (eq. 10); paper uses 0.997.
+  imagination_discount: 0.997
+  # PMPO coefficients (eq. 11): Alpha weights D+ vs D-, Beta weights the KL term.
+  pmpo_alpha: 0.5
+  pmpo_beta: 0.3
 
 # --- Optimizer ---
 optimizer:
   type: AdamW
-  lr: 1e-4
-  weight_decay: 1e-2
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
 
 # --- Trainer ---
 trainer:
-  max_epochs: 5
+  max_epochs: 8
   strategy: ddp
   devices: auto
   accelerator: gpu
-  precision: 16-mixed
+  precision: bf16-mixed
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 1
 
-# --- Logging ---
 wandb:
-  enable: false
+  enable: true
   project: swm-dreamer4
   entity: null
 
