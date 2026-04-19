@@ -17,11 +17,7 @@ import numpy as np
 
 from stable_worldmodel.wm.tdmpc2 import (
     TDMPC2,
-    two_hot,
-    two_hot_inv,
-    log_std,
-    gaussian_logprob,
-    squash,
+    tdmpc2_forward,
 )
 
 
@@ -47,145 +43,6 @@ class ModelObjectCallBack(Callback):
             torch.save(pl_module.model, path)
             logging.info(f'Saved world model to {path}')
 
-
-def tdmpc2_forward(self, batch, stage, cfg):
-    """
-    Executes the forward pass and loss computation for the TD-MPC2 world model and policy.
-
-    Args:
-        batch (dict): Dictionary containing environment observations, actions, and rewards.
-        stage (str): The current execution stage (e.g., 'train', 'validate').
-        cfg (DictConfig): Configuration object containing model and training hyperparameters.
-
-    Returns:
-        dict: The batch dictionary updated with the computed total loss under the 'loss' key.
-    """
-    encoding_keys = list(cfg.wm.get('encoding', {}).keys())
-    B, T_plus_1 = batch['action'].shape[:2]
-
-    flat_obs_dict = {}
-    for key in encoding_keys:
-        obs = batch[key]
-        flat_obs_dict[key] = obs.reshape(-1, *obs.shape[2:])
-
-    all_z = self.model.encode(flat_obs_dict).reshape(
-        B, T_plus_1, -1
-    )
-
-    z = all_z[:, 0]
-    target_zs = all_z[:, 1:]
-
-    loss_consistency, loss_reward, loss_value, loss_pi = 0, 0, 0, 0
-    discount = cfg.wm.get('discount', 0.99)
-    entropy_coef = cfg.wm.get('entropy_coef', 1e-4)
-
-    for t in range(cfg.wm.horizon):
-        action = batch['action'][:, t]
-        reward = batch['reward'][:, t]
-
-        next_z_pred, reward_pred = self.model.forward(z, action)
-
-        loss_consistency += F.mse_loss(
-            next_z_pred, target_zs[:, t].detach()
-        ) * (cfg.wm.rho**t)
-        target_reward = two_hot(reward, cfg)
-        loss_reward += -(
-            target_reward * F.log_softmax(reward_pred, dim=-1)
-        ).sum(-1).mean() * (cfg.wm.rho**t)
-
-        with torch.no_grad():
-            next_z_for_q = target_zs[:, t].detach()
-            mean_raw, log_std_raw = self.model.pi(next_z_for_q).chunk(
-                2, dim=-1
-            )
-            log_std_bounded = log_std(log_std_raw, low=-10, dif=12)
-            eps = torch.randn_like(mean_raw)
-            next_action_pred = torch.tanh(
-                mean_raw + eps * log_std_bounded.exp()
-            )
-
-            next_z_a = torch.cat([next_z_for_q, next_action_pred], dim=-1)
-            q_indices = random.sample(range(cfg.wm.num_q), 2)
-            next_qs = [
-                two_hot_inv(self.model.target_qs[i](next_z_a), cfg)
-                for i in q_indices
-            ]
-            next_q_min = torch.min(next_qs[0], next_qs[1])
-            target_q = reward.unsqueeze(1) + discount * next_q_min
-            target_q_two_hot = two_hot(target_q, cfg)
-
-        z_a = torch.cat([z, action], dim=-1)
-        for q in self.model.qs:
-            loss_value += -(
-                target_q_two_hot * F.log_softmax(q(z_a), dim=-1)
-            ).sum(-1).mean() * (cfg.wm.rho**t)
-
-        z_detached = z.detach()
-        mean_raw, log_std_raw = self.model.pi(z_detached).chunk(2, dim=-1)
-        log_std_bounded = log_std(log_std_raw, low=-10, dif=12)
-        eps = torch.randn_like(mean_raw)
-        log_prob = gaussian_logprob(eps, log_std_bounded)
-        scaled_log_prob = log_prob * cfg.action_dim
-
-        action_pi_raw = mean_raw + eps * log_std_bounded.exp()
-        mu, action_pi, log_prob = squash(mean_raw, action_pi_raw, log_prob)
-
-        entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-        scaled_entropy = -log_prob * entropy_scale
-
-        z_pi = torch.cat([z_detached, action_pi], dim=-1)
-        try:
-            self.model.qs.requires_grad_(False)
-            qs_pi = torch.stack(
-                [two_hot_inv(q(z_pi), cfg) for q in self.model.qs], dim=0
-            )
-        finally:
-            self.model.qs.requires_grad_(True)
-
-        q_indices = random.sample(range(cfg.wm.num_q), 2)
-        q_pi_avg = (qs_pi[q_indices[0]] + qs_pi[q_indices[1]]) / 2.0
-
-        if t == 0:
-            self.model.scale.update(q_pi_avg)
-        q_pi_normalized = self.model.scale(q_pi_avg)
-
-        step_pi_loss = -(entropy_coef * scaled_entropy + q_pi_normalized)
-        loss_pi += step_pi_loss.mean() * (cfg.wm.rho**t)
-
-        z = next_z_pred
-
-    loss_consistency /= cfg.wm.horizon
-    loss_reward /= cfg.wm.horizon
-    loss_value /= cfg.wm.horizon * cfg.wm.num_q
-    loss_pi /= cfg.wm.horizon
-
-    total_loss = (
-        cfg.wm.consistency_coef * loss_consistency
-        + cfg.wm.reward_coef * loss_reward
-        + cfg.wm.value_coef * loss_value
-        + loss_pi
-    )
-
-    self.log_dict(
-        {
-            f'{stage}/loss': total_loss,
-            f'{stage}/consist': loss_consistency,
-            f'{stage}/reward': loss_reward,
-            f'{stage}/value': loss_value,
-            f'{stage}/policy': loss_pi,
-        },
-        on_step=True,
-        sync_dist=False,
-        prog_bar=True,
-    )
-
-    if stage == 'train':
-        for q, t_q in zip(self.model.qs, self.model.target_qs):
-            for p, p_t in zip(q.parameters(), t_q.parameters()):
-                p_t.data.lerp_(p.data, cfg.wm.tau)
-
-    batch['loss'] = total_loss
-    return batch
 
 
 def get_column_normalizer(dataset, source, target):
@@ -311,6 +168,7 @@ def run(cfg):
         pin_memory=True,
         persistent_workers=True
     )
+
     val_loader = DataLoader(
         val_set, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
         pin_memory=True, persistent_workers=True
@@ -337,7 +195,7 @@ def run(cfg):
                 r'model\.(dynamics|reward|qs).*',
                 cfg.optimizer.lr,
             ),
-            'pi_opt': add_opt(r'model\.pi.*', cfg.optimizer.lr, eps=1e-5),
+            'pi_opt': add_opt(r'model\.pi.*', cfg.optimizer.lr * 0.1, eps=1e-5),
         },
     )
     subdir = cfg.subdir
@@ -351,7 +209,6 @@ def run(cfg):
         logger = WandbLogger(
             name=f'{cfg.wm.name}_{cfg.dataset_name}_{subdir}',
             project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
             resume='allow' if subdir else None,
             id=subdir or None,
             log_model=False,

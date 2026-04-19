@@ -55,8 +55,7 @@ from loguru import logger as logging
 import stable_worldmodel as swm
 from stable_worldmodel.solver.cem import CEMSolver
 from stable_worldmodel.policy import WorldModelPolicy, PlanConfig
-from stable_worldmodel.wm.tdmpc2 import TDMPC2
-from tdmpc2 import tdmpc2_forward
+from stable_worldmodel.wm.tdmpc2 import TDMPC2, tdmpc2_forward
 
 TASK_REGISTRY: dict[str, dict[str, int]] = {
     "cheetah": {
@@ -128,24 +127,23 @@ CEM_VAR_SCALE     = 2.0
 RECEDING_HORIZON  = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_CONFIG_PATH = Path(__file__).parent / "config" / "tdmpc2.yaml"
+_CONFIG_PATH = Path(__file__).parent / "config" / "tdmpc2_online.yaml"
 
 
 def load_cfg(obs_dim: int, action_dim: int, discount: float) -> OmegaConf:
-    """Load the shared offline config and override env-specific fields.
+    """Load the online config and override env-specific fields.
 
-    The yaml encoding key (e.g. 'state') is replaced with ENC_KEY
-    ('observation') since online DMControl envs always use that key.
-    The latent encoding dim is preserved from the yaml.
+    The encoding dim is preserved from the yaml; the key is replaced with
+    ENC_KEY ('observation') since online DMControl envs always use that key.
+    discount is computed from the episode length at runtime.
     """
     cfg = OmegaConf.load(_CONFIG_PATH)
     enc_dim = next(iter(OmegaConf.to_container(cfg.wm.encoding).values()))
     with open_dict(cfg):
-        cfg.action_dim             = action_dim
-        cfg.extra_dims             = {ENC_KEY: obs_dim}
-        cfg.wm.encoding            = {ENC_KEY: enc_dim}
-        cfg.wm.discount            = discount
-        cfg.wm.uncertainty_penalty = 0.0  
+        cfg.action_dim    = action_dim
+        cfg.extra_dims    = {ENC_KEY: obs_dim}
+        cfg.wm.encoding   = {ENC_KEY: enc_dim}
+        cfg.wm.discount   = discount
     return cfg
 
 

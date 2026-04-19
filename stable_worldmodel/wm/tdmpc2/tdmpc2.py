@@ -1,152 +1,22 @@
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-# ---------------------------------------------------------------------------
-# TD-MPC2 Math Utilities
-# ---------------------------------------------------------------------------
-
-
-def symlog(x):
-    return torch.sign(x) * torch.log(1 + torch.abs(x))
-
-
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
-
-
-def two_hot(x, cfg):
-    if x.ndim == 0:
-        x = x.unsqueeze(0).unsqueeze(0)
-    elif x.ndim == 1:
-        x = x.unsqueeze(-1)
-
-    bin_size = (cfg.wm.vmax - cfg.wm.vmin) / (cfg.wm.num_bins - 1)
-    x = torch.clamp(symlog(x), cfg.wm.vmin, cfg.wm.vmax)
-
-    indices = (x - cfg.wm.vmin) / bin_size
-    bin_idx = indices.floor().long()
-    bin_offset = indices - bin_idx
-
-    bin_idx = bin_idx.clamp(0, cfg.wm.num_bins - 2)
-
-    soft_two_hot = torch.zeros(
-        x.shape[0], cfg.wm.num_bins, device=x.device, dtype=x.dtype
-    )
-    soft_two_hot.scatter_(1, bin_idx, 1 - bin_offset)
-    soft_two_hot.scatter_(1, bin_idx + 1, bin_offset)
-
-    return soft_two_hot
-
-
-def two_hot_inv(logits, cfg):
-    device = logits.device
-    bin_values = torch.linspace(
-        cfg.wm.vmin, cfg.wm.vmax, cfg.wm.num_bins, device=device
-    )
-    probs = F.softmax(logits, dim=-1)
-    x = torch.sum(probs * bin_values, dim=-1, keepdim=True)
-    return symexp(x)
-
-
-def log_std(x, low=-10, dif=12):
-    return low + 0.5 * dif * (torch.tanh(x) + 1)
-
-
-def gaussian_logprob(eps, log_std):
-    residual = -0.5 * eps.pow(2) - log_std
-    log_prob = residual - 0.9189385175704956
-    return log_prob.sum(-1, keepdim=True)
-
-
-def squash(mu, pi, log_pi):
-    mu = torch.tanh(mu)
-    pi = torch.tanh(pi)
-    squashed_pi = torch.log(F.relu(1 - pi.pow(2)) + 1e-6)
-    log_pi = log_pi - squashed_pi.sum(-1, keepdim=True)
-    return mu, pi, log_pi
-
-
-# ---------------------------------------------------------------------------
-# TD-MPC2 Building Blocks
-# ---------------------------------------------------------------------------
-
-
-class SimNorm(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        # The paper uses V=8 as the default simplex dimensionality
-        self.simplex_dim = cfg.wm.get('simnorm_dim', 8)
-
-    def forward(self, x):
-        shp = x.shape
-        # Group the last dimension into L simplices of size V
-        x = x.view(*shp[:-1], -1, self.simplex_dim)
-        x = F.softmax(x, dim=-1)
-        return x.view(*shp)
-
-
-class NormedLinear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, dropout=0., act=None):
-        super().__init__(in_features, out_features, bias=bias)
-        self.ln = nn.LayerNorm(out_features)
-        self.act = act if act is not None else nn.Mish()
-        self.dropout = nn.Dropout(dropout, inplace=False) if dropout else None
-
-    def forward(self, x):
-        x = super().forward(x)
-        if self.dropout:
-            x = self.dropout(x)
-        return self.act(self.ln(x))
-
-
-class RunningScale(nn.Module):
-    def __init__(self, tau=0.01):
-        super().__init__()
-        self.tau = tau
-        self.register_buffer(
-            'value', torch.ones(1, dtype=torch.float32) * 10.0
-        )
-
-    def update(self, x):
-        with torch.no_grad():
-            percentile_95 = torch.quantile(x.detach().float(), 0.95)
-            percentile_05 = torch.quantile(x.detach().float(), 0.05)
-            scale_val = torch.clamp(percentile_95 - percentile_05, min=1e-4)
-            self.value.data.lerp_(scale_val.unsqueeze(0), self.tau)
-
-    def forward(self, x, update=False):
-        if update:
-            self.update(x)
-        return x / self.value
-
-
-def mlp(in_dim, mlp_dim, out_dim, act=None, dropout=0.0):
-    layers = [
-        NormedLinear(in_dim, mlp_dim, dropout=dropout),
-        NormedLinear(mlp_dim, mlp_dim),
-    ]
-    if act is not None:
-        layers.append(NormedLinear(mlp_dim, out_dim, act=act))
-    else:
-        layers.append(nn.Linear(mlp_dim, out_dim))
-    return nn.Sequential(*layers)
-
-
-def weight_init(m):
-    """Custom weight initialization for TD-MPC2."""
-    if isinstance(m, nn.Linear):
-        nn.init.trunc_normal_(m.weight, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-
-
-def zero_init(params):
-    """Zero-initialize specific parameters."""
-    for p in params:
-        if p is not None:
-            p.data.fill_(0)
+from .module import (
+    two_hot,
+    two_hot_inv,
+    log_std,
+    gaussian_logprob,
+    squash,
+    SimNorm,
+    NormedLinear,
+    RunningScale,
+    mlp,
+    weight_init,
+    zero_init,
+)
 
 
 class TDMPC2(nn.Module):
@@ -453,3 +323,149 @@ class TDMPC2(nn.Module):
         total_return   = G + discount * (1 - termination) * conservative_q
 
         return -total_return.view(B, N)
+
+
+def tdmpc2_forward(self, batch, stage, cfg):
+    """Forward pass and loss computation for TD-MPC2.
+
+    Designed to be used as a Lightning ``training_step`` or called directly
+    from an online training loop via a context object that implements
+    ``self.model`` and ``self.log_dict``.
+
+    Args:
+        batch: Dict with keys matching cfg.wm.encoding plus 'action' and 'reward'.
+        stage: 'train' or 'validate'. Controls target-network soft update.
+        cfg: OmegaConf config with wm.* hyperparameters.
+
+    Returns:
+        The batch dict with 'loss' set to the total scalar loss.
+    """
+    encoding_keys = list(cfg.wm.get('encoding', {}).keys())
+    B, T_plus_1 = batch['action'].shape[:2]
+
+    flat_obs_dict = {}
+    for key in encoding_keys:
+        obs = batch[key]
+        flat_obs_dict[key] = obs.reshape(-1, *obs.shape[2:])
+
+    all_z = self.model.encode(flat_obs_dict).reshape(B, T_plus_1, -1)
+
+    z = all_z[:, 0]
+    target_zs = all_z[:, 1:]
+
+    loss_consistency, loss_reward, loss_value, loss_pi = 0, 0, 0, 0
+    discount = cfg.wm.get('discount', 0.99)
+    entropy_coef = cfg.wm.get('entropy_coef', 1e-4)
+
+    for t in range(cfg.wm.horizon):
+        action = batch['action'][:, t]
+        reward = batch['reward'][:, t]
+
+        next_z_pred, reward_pred = self.model.forward(z, action)
+
+        loss_consistency += F.mse_loss(
+            next_z_pred, target_zs[:, t].detach()
+        ) * (cfg.wm.rho**t)
+        target_reward = two_hot(reward, cfg)
+        loss_reward += -(
+            target_reward * F.log_softmax(reward_pred, dim=-1)
+        ).sum(-1).mean() * (cfg.wm.rho**t)
+
+        with torch.no_grad():
+            next_z_for_q = target_zs[:, t].detach()
+            mean_raw, log_std_raw = self.model.pi(next_z_for_q).chunk(2, dim=-1)
+            log_std_bounded = log_std(log_std_raw, low=-10, dif=12)
+            eps = torch.randn_like(mean_raw)
+            next_action_pred = torch.tanh(mean_raw + eps * log_std_bounded.exp())
+
+            next_z_a = torch.cat([next_z_for_q, next_action_pred], dim=-1)
+            q_indices = random.sample(range(cfg.wm.num_q), 2)
+            next_qs = [
+                two_hot_inv(self.model.target_qs[i](next_z_a), cfg)
+                for i in q_indices
+            ]
+            next_q_min = torch.min(next_qs[0], next_qs[1])
+            target_q = reward.unsqueeze(1) + discount * next_q_min
+            target_q_two_hot = two_hot(target_q, cfg)
+
+        z_a = torch.cat([z, action], dim=-1)
+        for q in self.model.qs:
+            loss_value += -(
+                target_q_two_hot * F.log_softmax(q(z_a), dim=-1)
+            ).sum(-1).mean() * (cfg.wm.rho**t)
+
+        z_detached = z.detach()
+        mean_raw, log_std_raw = self.model.pi(z_detached).chunk(2, dim=-1)
+        log_std_bounded = log_std(log_std_raw, low=-10, dif=12)
+        eps = torch.randn_like(mean_raw)
+        log_prob = gaussian_logprob(eps, log_std_bounded)
+
+        action_pi_raw = mean_raw + eps * log_std_bounded.exp()
+        mu, action_pi, log_prob = squash(mean_raw, action_pi_raw, log_prob)
+
+        scaled_entropy = -log_prob * cfg.action_dim
+
+        z_pi = torch.cat([z_detached, action_pi], dim=-1)
+        try:
+            self.model.qs.requires_grad_(False)
+            qs_pi = torch.stack(
+                [two_hot_inv(q(z_pi), cfg) for q in self.model.qs], dim=0
+            )
+        finally:
+            self.model.qs.requires_grad_(True)
+
+        q_indices = random.sample(range(cfg.wm.num_q), 2)
+        q_pi_avg = (qs_pi[q_indices[0]] + qs_pi[q_indices[1]]) / 2.0
+
+        if t == 0:
+            self.model.scale.update(q_pi_avg)
+        q_pi_normalized = self.model.scale(q_pi_avg)
+
+        step_pi_loss = -(entropy_coef * scaled_entropy + q_pi_normalized)
+        loss_pi += step_pi_loss.mean() * (cfg.wm.rho**t)
+
+        z = next_z_pred
+
+    loss_consistency /= cfg.wm.horizon
+    loss_reward /= cfg.wm.horizon
+    loss_value /= cfg.wm.horizon * cfg.wm.num_q
+    loss_pi /= cfg.wm.horizon
+
+    total_loss = (
+        cfg.wm.consistency_coef * loss_consistency
+        + cfg.wm.reward_coef * loss_reward
+        + cfg.wm.value_coef * loss_value
+        + loss_pi
+    )
+
+    self.log_dict(
+        {
+            f'{stage}/loss': total_loss,
+            f'{stage}/consist': loss_consistency,
+            f'{stage}/reward': loss_reward,
+            f'{stage}/value': loss_value,
+            f'{stage}/policy': loss_pi,
+        },
+        on_step=True,
+        sync_dist=False,
+        prog_bar=True,
+    )
+
+    if stage == 'train':
+        for q, t_q in zip(self.model.qs, self.model.target_qs):
+            for p, p_t in zip(q.parameters(), t_q.parameters()):
+                p_t.data.lerp_(p.data, cfg.wm.tau)
+
+    batch['loss'] = total_loss
+    return batch
+
+
+__all__ = [
+    'TDMPC2',
+    'tdmpc2_forward',
+    'two_hot',
+    'two_hot_inv',
+    'log_std',
+    'gaussian_logprob',
+    'squash',
+]
