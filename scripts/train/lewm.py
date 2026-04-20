@@ -12,12 +12,12 @@ from omegaconf import OmegaConf, open_dict
 import numpy as np
 
 from stable_worldmodel.wm.lewm.module import (
-    JEPA,
-    ARPredictor,
+    Predictor,
     Embedder,
     MLP,
-    SIGReg,
 )
+from stable_worldmodel.wm.lewm import LeWM
+from stable_worldmodel.wm.loss import SIGReg
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
 
@@ -166,7 +166,7 @@ def run(cfg):
     embed_dim = cfg.wm.get('embed_dim', hidden_dim)
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
-    predictor = ARPredictor(
+    predictor = Predictor(
         num_frames=cfg.wm.history_size,
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
@@ -190,7 +190,7 @@ def run(cfg):
         norm_fn=torch.nn.BatchNorm1d,
     )
 
-    world_model = JEPA(
+    world_model = LeWM(
         encoder=encoder,
         predictor=predictor,
         action_encoder=action_encoder,

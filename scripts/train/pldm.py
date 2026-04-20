@@ -14,14 +14,13 @@ from torch import nn
 from torch.utils.data import DataLoader
 import numpy as np
 
-from stable_worldmodel.wm.lewm.module import (
-    JEPA,
+from stable_worldmodel.wm.pldm.module import (
     MLP,
     Embedder,
-    ARPredictor,
-    PathStraighteningLoss,
-    PLDM,
+    Predictor,
 )
+from stable_worldmodel.wm.pldm import PLDM
+from stable_worldmodel.wm.loss import PLDMLoss, TemporalStraighteningLoss
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
 
@@ -175,7 +174,7 @@ def run(cfg):
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get('embed_dim', hidden_dim)
 
-    predictor = ARPredictor(
+    predictor = Predictor(
         num_frames=cfg.wm.history_size,
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
@@ -204,7 +203,7 @@ def run(cfg):
         input_dim=2 * embed_dim, hidden_dim=512, output_dim=effective_act_dim
     )
 
-    world_model = JEPA(
+    world_model = PLDM(
         encoder=encoder,
         predictor=predictor,
         action_encoder=action_encoder,
@@ -218,8 +217,8 @@ def run(cfg):
     }
 
     losses = {
-        'pldm': PLDM(),
-        'path_straight': PathStraighteningLoss(),
+        'pldm': PLDMLoss(),
+        'path_straight': TemporalStraighteningLoss(),
     }
 
     optimizers = {}

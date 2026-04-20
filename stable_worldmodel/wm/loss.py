@@ -80,7 +80,7 @@ class VCReg(torch.nn.Module):
         }
 
 
-class PLDM(torch.nn.Module):
+class PLDMLoss(torch.nn.Module):
     """VCReg anti-collapse + Temporal Alignment + Inverse Dynamics Modeling losses
     reference: https://arxiv.org/abs/2502.14819
     """
@@ -125,7 +125,7 @@ class TemporalStraighteningLoss(torch.nn.Module):
 
 
 __all__ = [
-    'PLDM',
+    'PLDMLoss',
     'SIGReg',
     'TemporalStraighteningLoss',
     'VCReg',
