@@ -8,7 +8,7 @@ hydra:
 
 # --- Run ---
 output_model_name: dreamer4_${wm.phase}
-subdir: dynamics_complete
+subdir: agent_complete
 seed: 42
 
 # --- Data ---
@@ -16,14 +16,14 @@ dataset_name: pusht_expert_train_v2
 cache_dir: null
 image_size: 128
 
-batch_size: 20
+batch_size: 24
 num_workers: 4
 train_split: 1.0
 frameskip: 1
 
 # --- World model ---
 wm:
-  phase: dynamics       # tokenizer | dynamics | agent_finetune
+  phase: agent_finetune       # tokenizer | dynamics | agent_finetune
   horizon: 32
   patch: 4
 
@@ -77,8 +77,8 @@ wm:
   # ── Reward & policy heads ──────────────────────────────────────
   mlp_dim: 256
   num_bins: 101
-  vmin: -1.8                  
-  vmax: 0.1                    
+  vmin: -1.2
+  vmax: 0.1
   mtp_length: 8                # L in eq. 9 of the paper
   reward_coef: 1.0
   policy_coef: 1.0
@@ -90,11 +90,11 @@ wm:
 
   # ── Checkpoints ───────────────────────────────────────────────
   tokenizer_ckpt: /snfs2/luizfacury/datasets/weighted_95_2/dreamer4_tokenizer_epoch_5_object.ckpt
-  dynamics_ckpt: /snfs2/luizfacury/datasets/dynamics_4/dreamer4_dynamics_epoch_5_object.ckpt
+  dynamics_ckpt: /snfs2/luizfacury/datasets/dynamics_complete/dreamer4_dynamics_epoch_4_object.ckpt
   agent_finetune_ckpt: null
 
   # Lower LR for finetuning. If unset, falls back to optimizer.lr.
-  finetune_lr: 1.0e-4
+  finetune_lr: 3.0e-5
 
   # ── Phase 3: imagination training (paper eq. 10-11) ───────────
   # Horizon for each imagined rollout (shorter than agent_finetune horizon to
@@ -121,12 +121,12 @@ trainer:
   devices: auto
   accelerator: gpu
   precision: bf16-mixed
-  gradient_clip_val: 1.0
+  gradient_clip_val: 2.0
   accumulate_grad_batches: 1
 
 wandb:
   enable: true
-  project: swm-dreamer4
+  project: stable-wm
   entity: null
 
 dump_object: true

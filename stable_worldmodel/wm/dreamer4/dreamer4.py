@@ -813,6 +813,9 @@ class Dreamer4(nn.Module):
         self.task_embed = nn.Embedding(self.num_tasks, d_model_dyn)
         nn.init.normal_(self.task_embed.weight, std=0.02)
 
+        # Goal projection: encodes a goal latent into agent-token space.
+        self.goal_proj = nn.Linear(n_spatial * d_spatial, d_model_dyn) if n_agent > 0 else None
+
         # MTP reward head reading from transformer agent-token output (h_t)
         mlp_dim = cfg.wm.get("mlp_dim", 256)
         num_bins = cfg.wm.get("num_bins", 101)
@@ -905,9 +908,12 @@ class Dreamer4(nn.Module):
     def _flat(self, z):
         return z.flatten(-2)
 
-    def _build_agent_tokens(self, task_ids: torch.Tensor) -> torch.Tensor:
+    def _build_agent_tokens(self, task_ids: torch.Tensor,
+                            goal_z: Optional[torch.Tensor] = None) -> torch.Tensor:
         """task_ids: (B, T) long -> (B, T, n_agent, d_model_dyn)."""
         emb = self.task_embed(task_ids)                         # (B, T, d_model)
+        if goal_z is not None and self.goal_proj is not None:
+            emb = emb + self.goal_proj(goal_z).unsqueeze(1)    # broadcast over T
         return emb.unsqueeze(2).expand(-1, -1, self.n_agent, -1)
 
     def freeze_tokenizer(self):
@@ -929,6 +935,7 @@ class Dreamer4(nn.Module):
         horizon: int,
         start_h: Optional[torch.Tensor] = None,
         task_ids: Optional[torch.Tensor] = None,
+        goal_z: Optional[torch.Tensor] = None,
     ) -> dict:
         """Policy-driven imagination rollout from a starting latent state.
 
@@ -965,7 +972,7 @@ class Dreamer4(nn.Module):
                 tids = task_ids.unsqueeze(1).expand(-1, length)
             else:
                 tids = task_ids[:, :length]
-            return self._build_agent_tokens(tids)
+            return self._build_agent_tokens(tids, goal_z=goal_z)
 
         start_packed = self._pack(start_z)  # (B, n_spatial, d_spatial)
 
@@ -1067,7 +1074,7 @@ class Dreamer4(nn.Module):
             return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.packing_factor)
 
     def dynamics_loss(self, frames, actions=None, act_mask=None,
-                      bootstrap=True, task_ids=None):
+                      bootstrap=True, task_ids=None, goal_z=None):
         """Shortcut forcing loss. If n_agent > 0 and task_ids is given, builds
         agent tokens from task embeddings; h_t is returned in aux.
         """
@@ -1075,7 +1082,7 @@ class Dreamer4(nn.Module):
 
         agent_tokens = None
         if self.n_agent > 0 and task_ids is not None:
-            agent_tokens = self._build_agent_tokens(task_ids)
+            agent_tokens = self._build_agent_tokens(task_ids, goal_z=goal_z)
 
         train_ctx_noise = float(self.cfg.wm.get("ctx_noise", 0.0)) if self.training else 0.0
         loss, aux = shortcut_forcing_loss(
