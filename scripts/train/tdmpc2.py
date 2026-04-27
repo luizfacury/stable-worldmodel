@@ -1,7 +1,6 @@
 from functools import partial
 from pathlib import Path
 import random
-
 import hydra
 import lightning as pl
 import stable_pretraining as spt
@@ -43,6 +42,29 @@ class ModelObjectCallBack(Callback):
             torch.save(pl_module.model, path)
             logging.info(f'Saved world model to {path}')
 
+
+
+class GoalInjectTransform:
+    """Injects the episode goal (last observation of the episode) into each sample.
+
+    Uses a pre-computed table: goals_per_step[i] = last obs of the episode that
+    contains timestep i.  Requires 'ep_offset' to be loaded so we can look up
+    which episode a sequence belongs to.
+    """
+
+    def __init__(self, goals_per_step: torch.Tensor):
+        self.goals_per_step = goals_per_step  # (N, obs_dim)
+
+    def __call__(self, x: dict) -> dict:
+        ep_offset = x['ep_offset']
+        if isinstance(ep_offset, torch.Tensor):
+            idx = int(ep_offset.flatten()[0].item())
+        else:
+            idx = int(ep_offset.flat[0])
+        goal = self.goals_per_step[idx]        # (obs_dim,)
+        T = ep_offset.shape[0]
+        x['goal'] = goal.unsqueeze(0).expand(T, -1).clone()
+        return x
 
 
 def get_column_normalizer(dataset, source, target):
@@ -111,9 +133,13 @@ def run(cfg):
         raise ValueError('No encoding modalities defined in cfg.wm.encoding!')
 
     use_pixels = 'pixels' in encoding_keys
-    extra_keys = [k for k in encoding_keys if k != 'pixels']
+    use_goal = 'goal' in encoding_keys
+    # 'goal' is computed from episode boundaries, not loaded directly from the dataset
+    extra_keys = [k for k in encoding_keys if k not in ('pixels', 'goal')]
 
-    keys_to_load = encoding_keys + ['action', 'reward']
+    keys_to_load = [k for k in encoding_keys if k != 'goal'] + ['action', 'reward']
+    if use_goal:
+        keys_to_load += ['ep_offset']
 
     base_dataset = swm.data.HDF5Dataset(
         cfg.dataset_name,
@@ -121,6 +147,26 @@ def run(cfg):
         keys_to_load=keys_to_load,
         cache_dir=cfg.get('cache_dir'),
     )
+
+    # Pre-compute goal for every timestep when goal conditioning is requested.
+    # goal[i] = last observation of the episode containing timestep i,
+    # derived from the ep_offset and ep_len metadata stored in the dataset.
+    if use_goal:
+        goal_obs_key = cfg.get('goal_obs_key')
+        if goal_obs_key is None:
+            raise ValueError(
+                'cfg.goal_obs_key must specify which observation column to use as the '
+                'goal (e.g. "state") when "goal" is present in cfg.wm.encoding.'
+            )
+        _raw_obs = base_dataset.get_col_data(goal_obs_key)[:]
+        _ep_off = base_dataset.get_col_data('ep_offset')[:].flatten().astype(int)
+        _ep_len = base_dataset.get_col_data('ep_len')[:].flatten().astype(int)
+        _goal_idx = np.clip(_ep_off + _ep_len - 1, 0, len(_raw_obs) - 1)
+        goals_per_step = torch.from_numpy(_raw_obs[_goal_idx]).float()
+        logging.info(
+            f'Goal conditioning enabled: goal = last obs of each episode '
+            f'(source key: "{goal_obs_key}", dim: {goals_per_step.shape[-1]})'
+        )
 
     raw_actions = base_dataset.get_col_data('action')[:]
     valid_actions = raw_actions[~np.isnan(raw_actions).any(axis=1)]
@@ -144,6 +190,9 @@ def run(cfg):
         for key in extra_keys:
             cfg.extra_dims[key] = base_dataset.get_dim(key)
 
+        if use_goal:
+            cfg.extra_dims['goal'] = base_dataset.get_dim(goal_obs_key)
+
     transforms = []
     if use_pixels:
         transforms.append(
@@ -152,6 +201,19 @@ def run(cfg):
 
     for key in extra_keys:
         transforms.append(get_column_normalizer(base_dataset, key, key))
+
+    if use_goal:
+        transforms.append(GoalInjectTransform(goals_per_step))
+        _goal_clean = goals_per_step[~torch.isnan(goals_per_step).any(dim=1)]
+        _g_mean = _goal_clean.mean(0).clone()
+        _g_std = _goal_clean.std(0).clone() + 1e-2
+        transforms.append(
+            spt.data.transforms.WrapTorchTransform(
+                lambda x, m=_g_mean, s=_g_std: ((x - m.to(x.device)) / s.to(x.device)).float(),
+                source='goal',
+                target='goal',
+            )
+        )
 
     base_dataset.transform = spt.data.transforms.Compose(*transforms)
 

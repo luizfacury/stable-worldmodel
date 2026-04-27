@@ -12,7 +12,7 @@ subdir: null
 seed: 1
 
 # --- Data ---
-dataset_name: pusht_expert_train
+dataset_name: pusht_expert_train_v2
 cache_dir: null
 batch_size: 256
 num_workers: 16
@@ -44,16 +44,20 @@ wm:
   discount: 0.99
   uncertainty_penalty: 0.5
   entropy_coef: 1e-4
+  name: tdmpc2
 
   # Reward Scales
+  # reacher: r=-dist ∈[-0.44,0], worst-case Q symlog≈-3.7
+  # tworoom: r=-dist/260 ∈[-1,0],  worst-case Q symlog≈-4.2
+  # vmin=-5 covers both; vmax=2 buffers early-training Q drift above 0.
   num_bins: 101
-  vmin: -10
-  vmax: 0
+  vmin: -5
+  vmax: 2
 
   # --- DYNAMIC ENCODING ---
   # Add modalities as needed (e.g., proprio, state, pixels etc.)
   encoding:
-    state: 128
+    observation: 128
 
 # --- Optimizer ---
 optimizer:
