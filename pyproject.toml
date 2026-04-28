@@ -21,8 +21,10 @@ dependencies = [
   "tabulate",
   "gymnasium",
   "einops",
-  "h5py",
-  "hdf5plugin",
+  "lancedb>=0.30.0",
+  "pylance>=4.0.0",
+  "pyarrow",
+  "pillow",
   "tqdm",
   "typer",
   "rich",
@@ -54,8 +56,12 @@ env = [
     "ale-py",
 ]
 
-lerobot = [
+format = [
     "lerobot>=0.5.0; python_version >= '3.12'",
+    "h5py",
+    "hdf5plugin",
+    "decord",
+    "imageio[ffmpeg]",
 ]
 
 [dependency-groups]
