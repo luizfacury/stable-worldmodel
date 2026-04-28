@@ -19,7 +19,7 @@ world.set_policy(RandomPolicy())
 world.collect(
     path=Path(swm.data.utils.get_cache_dir())
     / 'datasets'
-    / 'pointmaze-teleport-navigate-v0.h5',
+    / 'pointmaze-teleport-navigate-v0.lance',
     episodes=2,
     seed=0,
 )

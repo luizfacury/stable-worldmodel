@@ -29,7 +29,7 @@ def run(cfg):
     world.collect(
         Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
         / 'datasets'
-        / 'dmc/reacher_random',
+        / 'dmc/reacher_random.lance',
         episodes=cfg.num_traj,
         seed=rng.integers(0, 1_000_000).item(),
         options=options,

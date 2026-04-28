@@ -53,7 +53,7 @@ def run(cfg):
     world.collect(
         Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
         / 'datasets'
-        / f'dmc/{name}_expert',
+        / f'dmc/{name}_expert.lance',
         episodes=cfg.num_traj,
         seed=rng.integers(0, 1_000_000).item(),
         options=options,

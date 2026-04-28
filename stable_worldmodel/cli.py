@@ -346,10 +346,15 @@ def convert(
 
     h5_path = cache_dir / f'{name}.h5'
     folder_path = cache_dir / name
+    lance_path = cache_dir / f'{name}.lance'
     if h5_path.exists():
         source_path = h5_path
     elif folder_path.is_dir() and (folder_path / 'ep_len.npz').exists():
         source_path = folder_path
+    elif folder_path.is_dir() and (folder_path / '_versions').is_dir():
+        source_path = folder_path
+    elif lance_path.is_dir() and (lance_path / '_versions').is_dir():
+        source_path = lance_path
     else:
         print(f'[red]Dataset not found: {name}[/red]')
         print('Run [cyan]swm datasets[/cyan] to see available datasets.')

@@ -21,7 +21,7 @@ def run(cfg):
         world.collect(
             Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
             / 'datasets'
-            / f'pusht_toy/shard_{i}',
+            / f'pusht_toy/shard_{i}.lance',
             episodes=500,
             seed=rng.integers(0, 1_000_000).item(),
         )

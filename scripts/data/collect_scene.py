@@ -36,7 +36,7 @@ def run(cfg: DictConfig):
     world.collect(
         Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
         / 'datasets'
-        / 'ogbench/scene_single_expert',
+        / 'ogbench/scene_single_expert.lance',
         episodes=cfg.num_traj,
         seed=rng.integers(0, 1_000_000).item(),
         options=options,

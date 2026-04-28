@@ -143,7 +143,9 @@ class VideoWriter:
             self.path / 'ep_offset.npz', np.asarray(self._offsets, np.int64)
         )
         for col, parts in self._tabular.items():
-            np.savez(self.path / f'{col}.npz', np.concatenate(parts, axis=0))
+            out = self.path / f'{col}.npz'
+            out.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(out, np.concatenate(parts, axis=0))
 
     def write_episode(self, ep_data: dict) -> None:
         import imageio
