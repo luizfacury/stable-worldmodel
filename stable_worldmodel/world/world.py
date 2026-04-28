@@ -56,6 +56,7 @@ RESET_MODES = ('auto', 'wait')
 
 
 def _make_env(env_name, max_episode_steps, wrappers, **kwargs):
+    kwargs.setdefault('render_mode', 'rgb_array')
     env = gym.make(env_name, max_episode_steps=max_episode_steps, **kwargs)
     for wrapper in wrappers:
         env = wrapper(env)

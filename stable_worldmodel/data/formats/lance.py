@@ -634,9 +634,12 @@ class LanceWriter:
         self._appending_existing = True
 
     def _validate_episode_against_existing(self, ep_data: dict) -> None:
+        reserved = {'episode_idx', 'step_idx'}
         incoming_to_lance: dict[str, str] = {}
         for col in ep_data:
             lance_name = _to_lance_name(col)
+            if lance_name in reserved:
+                continue
             if lance_name in incoming_to_lance.values():
                 raise ValueError(
                     f'LanceWriter: append failed — incoming columns map to '
@@ -690,8 +693,19 @@ class LanceWriter:
         dims: dict[str, int] = {}
         ordered_cols: list[str] = []
 
+        reserved = {'episode_idx', 'step_idx'}
+        dropped = [c for c in sample_ep if _to_lance_name(c) in reserved]
+        if dropped:
+            logging.warning(
+                'LanceWriter: dropping incoming columns %s — names reserved '
+                'for the writer-managed index columns.',
+                dropped,
+            )
+
         for col, vals in sample_ep.items():
             lance_name = _to_lance_name(col)
+            if lance_name in reserved:
+                continue
             rename_map[col] = lance_name
             ordered_cols.append(lance_name)
 
