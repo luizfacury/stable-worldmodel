@@ -1,4 +1,4 @@
-# stable-worldmodel
+<h1 align="center">stable-worldmodel</h1>
 
 <p align="center"><i>A platform for reproducible world model research and evaluation.</i></p>
 
