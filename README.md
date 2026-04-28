@@ -3,7 +3,7 @@
 </h1>
 
 <h2 align="center">
-    <p><i>World model research made simple. From data collection to training and evaluation.</i></p>
+    <p><i>A Platform for Reproducible World Model Research and Evaluation.</i></p>
 </h2>
 
 <div align="center" style="line-height: 1;">
