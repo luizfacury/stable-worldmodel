@@ -234,7 +234,7 @@ def run(cfg):
     encoding_keys = list(cfg.wm.get('encoding', {}).keys())
     keys_to_load = ['pixels'] + encoding_keys
 
-    dataset = swm.data.HDF5Dataset(
+    dataset = swm.data.load_dataset(
         cfg.dataset_name,
         num_steps=cfg.n_steps,
         frameskip=cfg.frameskip,
