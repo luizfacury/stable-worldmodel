@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - launcher: local
   - data: pusht
 
 output_model_name: lewm
