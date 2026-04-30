@@ -355,15 +355,8 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     logger = None
-    if cfg.wandb.enable:
-        logger = WandbLogger(
-            name='dino_wm',
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            resume='allow' if run_id else None,
-            id=run_id or None,
-            log_model=False,
-        )
+    if cfg.wandb.enabled:
+        logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     trainer = pl.Trainer(
