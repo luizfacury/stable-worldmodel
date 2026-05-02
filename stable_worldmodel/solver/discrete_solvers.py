@@ -189,6 +189,8 @@ class PGDSolver(torch.nn.Module):
                         self.num_samples,
                         axis=1,
                     )
+                else:
+                    batch_v = v
                 expanded_infos[k] = batch_v
 
             # Perform Gradient Descent for this batch
