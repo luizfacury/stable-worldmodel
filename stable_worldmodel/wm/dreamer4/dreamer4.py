@@ -851,6 +851,13 @@ class Dreamer4(nn.Module):
         nn.init.zeros_(self.value.head.weight)
         nn.init.zeros_(self.value.head.bias)
 
+        # Slow EMA target critic — lagged copy of value used to bootstrap λ-returns.
+        # Prevents the fast value head from chasing its own targets (bootstrap divergence).
+        self.value_target = ValueHead(d_model_dyn, mlp_dim, num_bins)
+        self.value_target.load_state_dict(self.value.state_dict())
+        self.value_target.requires_grad_(False)
+        self.value_ema_decay = float(cfg.wm.get("value_ema_decay", 0.98))
+
         # Policy prior — frozen copy of the Phase 2 policy head used for the KL
         # regularisation term in the PMPO objective (eq. 11).  Weights are copied
         # from self.policy via freeze_policy_prior() at the start of Phase 3.
@@ -929,6 +936,12 @@ class Dreamer4(nn.Module):
             p.requires_grad_(False)
 
     @torch.no_grad()
+    def update_value_target(self):
+        d = self.value_ema_decay
+        for p_tgt, p_src in zip(self.value_target.parameters(), self.value.parameters()):
+            p_tgt.data.mul_(d).add_((1.0 - d) * p_src.data)
+
+    @torch.no_grad()
     def imagine_rollout(
         self,
         start_z: torch.Tensor,
@@ -994,10 +1007,12 @@ class Dreamer4(nn.Module):
         actions_list:  list = []
 
         for t in range(horizon):
-            # Sample action a_t ~ pi_theta(·|s_t) using the current policy.
+            # Deterministic actions: PMPO D+/D- split is based on advantage (state
+            # quality), so the NLL gradient must correlate with action quality.
+            # Stochastic sampling makes grad(NLL) ≈ noise × J_θ, which is
+            # independent of the D+/D- split → expected PMPO gradient ≈ 0.
             means = self.policy(h_prev.unsqueeze(1))[:, 0, 0]   # (B, A) n=0 MTP
-            std   = torch.exp(self.policy.log_std)
-            a_t   = (means + std * torch.randn_like(means)).clamp(-1, 1)
+            a_t   = means.clamp(-1, 1)
 
             actions_list.append(a_t)
             a_hist.append(a_t)

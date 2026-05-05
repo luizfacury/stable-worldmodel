@@ -8,8 +8,8 @@ hydra:
 
 # --- Run ---
 output_model_name: dreamer4_${wm.phase}
-subdir: agent_complete
-seed: 42
+subdir: imagination_complete_3
+seed: 0
 
 # --- Data ---
 dataset_name: pusht_expert_train_v2
@@ -23,7 +23,7 @@ frameskip: 1
 
 # --- World model ---
 wm:
-  phase: agent_finetune       # tokenizer | dynamics | agent_finetune
+  phase: imagination_training       # tokenizer | dynamics | agent_finetune
   horizon: 32
   patch: 4
 
@@ -42,10 +42,7 @@ wm:
   lpips_frac: 0.5
   lpips_net: alex
 
-  # ── Dynamics architecture ──────────────────────────────────────
-  # IMPORTANT: every arch field below must match the dynamics checkpoint
-  # you are loading, otherwise strict=False loading will silently leave
-  # transformer weights at random init.
+  
   d_model_dyn: 512
   n_heads_dyn: 4
   n_kv_heads_dyn: 2          # GQA: set to e.g. 2 for 4 query heads; null = standard MHA (recommended for small models)
@@ -77,8 +74,9 @@ wm:
   # ── Reward & policy heads ──────────────────────────────────────
   mlp_dim: 256
   num_bins: 101
-  vmin: -1.2
+  vmin: -1.2        # reward head bins (per-step rewards fit here)
   vmax: 0.1
+  value_vmin: -5.0  # value head bins; symexp(-5)≈-147 covers long-horizon λ-returns
   mtp_length: 8                # L in eq. 9 of the paper
   reward_coef: 1.0
   policy_coef: 1.0
@@ -91,19 +89,19 @@ wm:
   # ── Checkpoints ───────────────────────────────────────────────
   tokenizer_ckpt: /snfs2/luizfacury/datasets/weighted_95_2/dreamer4_tokenizer_epoch_5_object.ckpt
   dynamics_ckpt: /snfs2/luizfacury/datasets/dynamics_complete/dreamer4_dynamics_epoch_4_object.ckpt
-  agent_finetune_ckpt: null
+  agent_finetune_ckpt: /snfs2/luizfacury/datasets/agent_complete/dreamer4_agent_finetune_epoch_6_object.ckpt
 
   # Lower LR for finetuning. If unset, falls back to optimizer.lr.
   finetune_lr: 3.0e-5
 
-  # ── Phase 3: imagination training (paper eq. 10-11) ───────────
-  # Horizon for each imagined rollout (shorter than agent_finetune horizon to
-  # keep memory manageable; paper uses H=15).
-  imagination_horizon: 15
+  imagination_horizon: 10
   # lambda for TD lambda-returns (eq. 10); 0.95 follows standard DreamerV3 choice.
   lambda_return: 0.95
   # gamma for imagination discount (eq. 10); paper uses 0.997.
-  imagination_discount: 0.997
+  imagination_discount: 0.97
+
+  value_ema_decay: 0.98
+
   # PMPO coefficients (eq. 11): Alpha weights D+ vs D-, Beta weights the KL term.
   pmpo_alpha: 0.5
   pmpo_beta: 0.3
@@ -121,7 +119,7 @@ trainer:
   devices: auto
   accelerator: gpu
   precision: bf16-mixed
-  gradient_clip_val: 2.0
+  gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
 wandb:

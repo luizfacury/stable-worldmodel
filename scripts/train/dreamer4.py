@@ -71,12 +71,16 @@ from stable_worldmodel.wm.dreamer4.module import (
 class GoalLastFrameWrapper:
     """Wraps an HDF5Dataset to add goal_pixels and steps_remaining per clip.
 
-    goal_pixels: (3, H, W) uint8 — last frame of the episode (hindsight goal)
+    goal_pixels: (3, H, W) uint8 — a future frame sampled uniformly from
+        [clip_start + min_goal_offset, episode_last_frame].  Randomising the
+        goal distance (rather than always using the last frame) makes the model
+        robust to the fixed-offset goals used at evaluation time.
     steps_remaining: (T,) float32 — steps until episode end for each frame
     """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, min_goal_offset: int = 25):
         self.dataset = dataset
+        self.min_goal_offset = min_goal_offset
 
     def __len__(self):
         return len(self.dataset)
@@ -92,7 +96,15 @@ class GoalLastFrameWrapper:
         steps_remaining = (ep_len - 1 - local_steps).astype(np.float32)
         batch['steps_remaining'] = torch.from_numpy(steps_remaining)
 
-        goal_global = int(self.dataset.offsets[ep_idx]) + ep_len - 1
+        # Sample goal uniformly from [start + min_goal_offset, ep_len - 1].
+        # Falls back to last frame when the episode is shorter than the offset.
+        min_goal_local = min(start + self.min_goal_offset, ep_len - 1)
+        max_goal_local = ep_len - 1
+        if max_goal_local > min_goal_local:
+            goal_local = int(np.random.randint(min_goal_local, max_goal_local + 1))
+        else:
+            goal_local = min_goal_local
+        goal_global = int(self.dataset.offsets[ep_idx]) + goal_local
         self.dataset._open()
         goal_np = self.dataset.h5_file['pixels'][goal_global]   # (H, W, 3) uint8
         batch['goal_pixels'] = torch.from_numpy(goal_np.copy()).permute(2, 0, 1)
@@ -109,11 +121,21 @@ class GoalLastFrameWrapper:
 class ModelObjectCallBack(Callback):
     """Periodically save the full model object for easy reloading."""
 
-    def __init__(self, dirpath, filename='model_object', epoch_interval=1):
+    def __init__(self, dirpath, filename='model_object', epoch_interval=1, step_interval=None):
         super().__init__()
         self.dirpath = Path(dirpath)
         self.filename = filename
         self.epoch_interval = epoch_interval
+        self.step_interval = step_interval  # None = epoch-only; int = also save every N global steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.step_interval is None or not trainer.is_global_zero:
+            return
+        step = trainer.global_step
+        if step > 0 and step % self.step_interval == 0:
+            path = self.dirpath / f'{self.filename}_step_{step}_object.ckpt'
+            torch.save(pl_module.model, path)
+            logging.info(f'Saved Dreamer4 model to {path}')
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
@@ -143,7 +165,10 @@ def run(cfg):
     if not encoding_keys:
         encoding_keys = ['pixels']
 
-    keys_to_load = list(set(encoding_keys + ['action']))
+    # 'reward' is loaded for paper-faithful agent_finetune / imagination_training:
+    # paper §3.3 takes scalar rewards r_t directly from the dataset as MTP targets.
+    # Tokenizer & dynamics phases ignore it (no extra cost; just an extra field).
+    keys_to_load = list(set(encoding_keys + ['action', 'reward']))
 
     base_dataset = swm.data.HDF5Dataset(
         cfg.dataset_name,
@@ -238,37 +263,39 @@ def run(cfg):
                 model.tokenizer.load_state_dict(tok_state, strict=False)
         model.freeze_tokenizer()
 
-        # Load dynamics from Phase 2 checkpoint. strict=False because
-        # n_agent was 0 in Phase 2 and is >=1 now, so the agent-token
-        # parameters are new.
-        dyn_ckpt = cfg.wm.get('dynamics_ckpt', None)
-        assert dyn_ckpt is not None, (
-            f'{phase} phase requires cfg.wm.dynamics_ckpt'
-        )
-        logging.info(f'Loading dynamics from {dyn_ckpt}')
-        ckpt = torch.load(dyn_ckpt, map_location='cpu', weights_only=False)
-        if isinstance(ckpt, torch.nn.Module):
-            missing, unexpected = model.dynamics.load_state_dict(
-                ckpt.dynamics.state_dict(), strict=False,
+        if phase == 'agent_finetune':
+            # Load dynamics from Phase 2 checkpoint. strict=False because
+            # n_agent was 0 in Phase 2 and is >=1 now, so the agent-token
+            # parameters are new.
+            dyn_ckpt = cfg.wm.get('dynamics_ckpt', None)
+            assert dyn_ckpt is not None, (
+                'agent_finetune phase requires cfg.wm.dynamics_ckpt'
             )
-        else:
-            dyn_state = ckpt.get('model', ckpt)
-            dyn_state = {
-                k.replace('dynamics.', ''): v
-                for k, v in dyn_state.items()
-                if k.startswith('dynamics.')
-            } or dyn_state
-            missing, unexpected = model.dynamics.load_state_dict(
-                dyn_state, strict=False,
+            logging.info(f'Loading dynamics from {dyn_ckpt}')
+            ckpt = torch.load(dyn_ckpt, map_location='cpu', weights_only=False)
+            if isinstance(ckpt, torch.nn.Module):
+                missing, unexpected = model.dynamics.load_state_dict(
+                    ckpt.dynamics.state_dict(), strict=False,
+                )
+            else:
+                dyn_state = ckpt.get('model', ckpt)
+                dyn_state = {
+                    k.replace('dynamics.', ''): v
+                    for k, v in dyn_state.items()
+                    if k.startswith('dynamics.')
+                } or dyn_state
+                missing, unexpected = model.dynamics.load_state_dict(
+                    dyn_state, strict=False,
+                )
+            logging.info(
+                f'Dynamics loaded. Missing keys (expected, new agent params): '
+                f'{len(missing)}. Unexpected: {len(unexpected)}.'
             )
-        logging.info(
-            f'Dynamics loaded. Missing keys (expected, new agent params): '
-            f'{len(missing)}. Unexpected: {len(unexpected)}.'
-        )
 
-        if phase == 'imagination_training':
-            # For Phase 3 we additionally need the Phase 2 policy/reward weights.
+        elif phase == 'imagination_training':
             # Load the full agent_finetune checkpoint (which is a Dreamer4 object).
+            # Dynamics comes from here — NOT from the Phase 2 dynamics_ckpt — so
+            # we preserve the 6 epochs of agent_finetune dynamics adaptation.
             af_ckpt = cfg.wm.get('agent_finetune_ckpt', None)
             assert af_ckpt is not None, (
                 'imagination_training phase requires cfg.wm.agent_finetune_ckpt'
@@ -276,16 +303,26 @@ def run(cfg):
             logging.info(f'Loading agent_finetune checkpoint from {af_ckpt}')
             af = torch.load(af_ckpt, map_location='cpu', weights_only=False)
             if isinstance(af, torch.nn.Module):
+                # strict=True: af dynamics already has agent tokens, architecture matches.
+                missing, unexpected = model.dynamics.load_state_dict(
+                    af.dynamics.state_dict(), strict=True,
+                )
+                logging.info(
+                    f'Dynamics loaded from agent_finetune ckpt. '
+                    f'Missing: {len(missing)}, Unexpected: {len(unexpected)}.'
+                )
                 model.reward.load_state_dict(af.reward.state_dict(), strict=True)
                 model.policy.load_state_dict(af.policy.state_dict(), strict=True)
                 if hasattr(af, 'task_embed'):
                     model.task_embed.load_state_dict(af.task_embed.state_dict(), strict=True)
-                logging.info('reward, policy, task_embed loaded from agent_finetune checkpoint.')
+                if hasattr(af, 'goal_proj') and af.goal_proj is not None and model.goal_proj is not None:
+                    model.goal_proj.load_state_dict(af.goal_proj.state_dict(), strict=True)
+                logging.info('dynamics, reward, policy, task_embed, goal_proj loaded from agent_finetune checkpoint.')
             else:
-                logging.warning('agent_finetune_ckpt is not a nn.Module — skipping policy/reward load.')
+                logging.warning('agent_finetune_ckpt is not a nn.Module — skipping all loads.')
             # Freeze policy as prior before any gradient updates.
             model.freeze_policy_prior()
-            logging.info('policy_prior frozen (copy of Phase 2 policy).')
+            logging.info('policy_prior frozen (copy of agent_finetune policy).')
 
     # ── Optimizer + forward function per phase ───────────────────────
     def opt_cfg(module_regex, lr, eps=1e-8):
@@ -294,28 +331,36 @@ def run(cfg):
         oc['eps'] = eps
         return {'modules': module_regex, 'optimizer': oc}
 
+    # spt assigns *modules* to optimizer groups by regex on the qualified module
+    # name, then collects each matched module's direct params. `model\.X\..*`
+    # only matches descendants of X — it does NOT match X itself, so direct
+    # nn.Parameters on X (e.g. policy.log_std, dynamics.register_tokens,
+    # task_embed.weight, goal_proj.{weight,bias}) get silently dropped from the
+    # optimizer. The `(\..*|$)` form matches both the bare module and its
+    # descendants while still excluding sibling names like `model.policy_prior`.
     if phase == 'tokenizer':
         forward_fn = partial(tokenizer_forward, cfg=cfg)
         optim = {
-            'tok_opt': opt_cfg(r'model\.tokenizer\..*', cfg.optimizer.lr),
+            'tok_opt': opt_cfg(r'model\.tokenizer(\..*|$)', cfg.optimizer.lr),
         }
     elif phase == 'dynamics':
         forward_fn = partial(dynamics_forward, cfg=cfg)
         optim = {
-            'dyn_opt': opt_cfg(r'model\.dynamics\..*', cfg.optimizer.lr),
+            'dyn_opt': opt_cfg(r'model\.dynamics(\..*|$)', cfg.optimizer.lr),
         }
     elif phase == 'agent_finetune':
         forward_fn = partial(agent_finetune_forward, cfg=cfg)
         # Pretrained dynamics weights use a lower finetune LR; brand-new
-        # parameters (reward head, policy head, task embedding) use the
-        # full base LR so they train from scratch at an appropriate rate.
+        # parameters (reward head, policy head, task embedding, goal_proj)
+        # use the full base LR so they train from scratch at an appropriate rate.
         ft_lr = float(cfg.wm.get('finetune_lr', cfg.optimizer.lr))
         base_lr = float(cfg.optimizer.lr)
         optim = {
-            'dyn_opt':    opt_cfg(r'model\.dynamics\..*',   ft_lr),
-            'reward_opt': opt_cfg(r'model\.reward\..*',     base_lr),
-            'policy_opt': opt_cfg(r'model\.policy\..*',     base_lr),
-            'task_opt':   opt_cfg(r'model\.task_embed\..*', base_lr),
+            'dyn_opt':    opt_cfg(r'model\.dynamics(\..*|$)',   ft_lr),
+            'reward_opt': opt_cfg(r'model\.reward(\..*|$)',     base_lr),
+            'policy_opt': opt_cfg(r'model\.policy(\..*|$)',     base_lr),
+            'task_opt':   opt_cfg(r'model\.task_embed(\..*|$)', base_lr),
+            'goal_opt':   opt_cfg(r'model\.goal_proj(\..*|$)',  base_lr),
         }
     else:  # imagination_training
         forward_fn = partial(imagination_forward, cfg=cfg)
@@ -323,12 +368,13 @@ def run(cfg):
         base_lr = float(cfg.optimizer.lr)
         optim = {
             # policy and value heads: full base LR (new objectives)
-            'policy_opt': opt_cfg(r'model\.policy\..*',    base_lr),
-            'value_opt':  opt_cfg(r'model\.value\..*',     base_lr),
-            # dynamics, reward, task_embed: lower ft LR (preserve Phase 2 capability)
-            'dyn_opt':    opt_cfg(r'model\.dynamics\..*',  ft_lr),
-            'reward_opt': opt_cfg(r'model\.reward\..*',    ft_lr),
-            'task_opt':   opt_cfg(r'model\.task_embed\..*', ft_lr),
+            'policy_opt': opt_cfg(r'model\.policy(\..*|$)',     base_lr),
+            'value_opt':  opt_cfg(r'model\.value(\..*|$)',      base_lr),
+            # dynamics, reward, task_embed, goal_proj: lower ft LR (preserve Phase 2 capability)
+            'dyn_opt':    opt_cfg(r'model\.dynamics(\..*|$)',   ft_lr),
+            'reward_opt': opt_cfg(r'model\.reward(\..*|$)',     ft_lr),
+            'task_opt':   opt_cfg(r'model\.task_embed(\..*|$)', ft_lr),
+            'goal_opt':   opt_cfg(r'model\.goal_proj(\..*|$)',  ft_lr),
             # policy_prior is frozen — excluded from optimizer
         }
 
@@ -362,6 +408,10 @@ def run(cfg):
     if strategy in ('ddp', 'ddp_find_unused_parameters_false'):
         strategy = 'ddp_find_unused_parameters_true'
 
+    # Save a step-level checkpoint every 5000 steps during imagination_training
+    # (epoch is ~36k steps at ~1800 steps/hour — too long to wait for epoch end).
+    step_interval = 5000 if phase == 'imagination_training' else None
+
     trainer = pl.Trainer(
         **trainer_kwargs,
         strategy=strategy,
@@ -370,6 +420,7 @@ def run(cfg):
             ModelObjectCallBack(
                 dirpath=run_dir,
                 filename=f'dreamer4_{phase}',
+                step_interval=step_interval,
             ),
         ],
     )

@@ -150,7 +150,6 @@ def agent_finetune_forward(self, batch, stage, cfg):
         pixels = pixels.float() / 255.0
 
     actions = batch['action'].to(device).float()
-    steps_remaining = batch['steps_remaining'].to(device).float()   # (B, T+1)
     goal_pixels = batch['goal_pixels'].to(device)                   # (B, 3, H, W) uint8
     if goal_pixels.dtype == torch.uint8:
         goal_pixels = goal_pixels.float() / 255.0
@@ -164,8 +163,8 @@ def agent_finetune_forward(self, batch, stage, cfg):
     T = T_plus_1 - 1
     L = int(cfg.wm.get('mtp_length', 8))
 
-    discount = float(cfg.wm.get('discount', 0.99))
-    rewards = discount ** steps_remaining[:, :T].clamp(min=0) - 1.0  # (B, T) in (-1, 0]
+    # Paper §3.3: scalar rewards r_t come directly from the dataset.
+    rewards = batch['reward'][:, :T].to(device).float()             # (B, T)
 
     frames = pixels[:, :-1]
 
@@ -292,13 +291,23 @@ def imagination_forward(self, batch, stage, cfg):
     H_imag = int(cfg.wm.get('imagination_horizon',    15))
     L      = int(cfg.wm.get('mtp_length',             8))
 
+    # Value head needs a wider bin range than the reward head: per-step rewards
+    # fit in [vmin, vmax], but λ-returns accumulate over H steps and go well below.
+    # We build a thin wrapper so reward-head calls keep the original bins.
+    import types as _types
+    _val_wm = _types.SimpleNamespace(**{
+        **{k: getattr(cfg.wm, k) for k in dir(cfg.wm) if not k.startswith('_')},
+        'vmin': float(cfg.wm.get('value_vmin', -3.0)),
+        'vmax': float(cfg.wm.get('value_vmax', cfg.wm.vmax)),
+    })
+    val_cfg = _types.SimpleNamespace(wm=_val_wm)
+
     # ── A) Real-data Phase 2 losses ───────────────────────────────────────
     pixels = batch['pixels'].to(device)
     if pixels.dtype == torch.uint8:
         pixels = pixels.float() / 255.0
 
     actions = batch['action'].to(device).float()
-    steps_remaining = batch['steps_remaining'].to(device).float()   # (B, T+1)
     goal_pixels = batch['goal_pixels'].to(device)                   # (B, 3, H, W) uint8
     if goal_pixels.dtype == torch.uint8:
         goal_pixels = goal_pixels.float() / 255.0
@@ -311,8 +320,8 @@ def imagination_forward(self, batch, stage, cfg):
     B, T_plus_1 = pixels.shape[:2]
     T = T_plus_1 - 1
 
-    discount = float(cfg.wm.get('discount', 0.99))
-    rewards = discount ** steps_remaining[:, :T].clamp(min=0) - 1.0  # (B, T) in (-1, 0]
+    # Paper §3.3: scalar rewards r_t come directly from the dataset.
+    rewards = batch['reward'][:, :T].to(device).float()             # (B, T)
 
     frames = pixels[:, :-1]
 
@@ -371,35 +380,37 @@ def imagination_forward(self, batch, stage, cfg):
     r_logits = imag['r_logits']  # (B, H, num_bins) — detached
     a_imag   = imag['actions']   # (B, H, A)         — detached
 
+    # EMA-update the slow target before computing this step's targets.
+    self.model.update_value_target()
+
     # Rewards from imagination (targets for λ-returns — no grad needed)
     with torch.no_grad():
         r_imag = two_hot_inv(r_logits, cfg).squeeze(-1)   # (B, H)
 
-    # Value predictions — grad flows through value head params only
-    val_logits = self.model.value(h_imag)                          # (B, H, num_bins)
-    values     = two_hot_inv(val_logits, cfg).squeeze(-1)          # (B, H)
+        # Slow target: used for bootstrap and advantage baseline.
+        # The lagged weights break the feedback loop that drives value divergence.
+        tgt_logits  = self.model.value_target(h_imag)
+        values_tgt  = two_hot_inv(tgt_logits, val_cfg).squeeze(-1)        # (B, H)
+        lambda_ret  = _lambda_returns(r_imag, values_tgt, gamma, lam)     # (B, H)
 
-    # λ-returns are targets: stop grad so value head is not updated via λ
-    with torch.no_grad():
-        lambda_ret = _lambda_returns(r_imag, values.detach(), gamma, lam)  # (B, H)
+    # Fast value head — trained to fit lambda_ret; grad flows here only.
+    val_logits = self.model.value(h_imag)                              # (B, H, num_bins)
 
     # ── Value loss: -log p_θ(R_t^λ | s_t) ────────────────────────────────
-    target_2h_val = two_hot_batch(lambda_ret, cfg)                 # (B, H, num_bins)
+    target_2h_val = two_hot_batch(lambda_ret, val_cfg)                 # (B, H, num_bins)
     value_loss    = -(target_2h_val * torch.log_softmax(val_logits, dim=-1)).sum(-1).mean()
 
     # ── PMPO policy loss (eq. 11) ─────────────────────────────────────────
-    # Policy means — grad flows through policy head params only
     policy_out        = self.model.policy(h_imag)       # (B, H, L+1, A)
     policy_means_imag = policy_out[:, :, 0, :]          # (B, H, A) — n=0 MTP
 
-    # NLL of imagined actions under current policy
     policy_nll = self.model.policy.nll_per(
         policy_out[:, :, :1, :],     # (B, H, 1, A)
         a_imag.unsqueeze(2),         # (B, H, 1, A)
     )[:, :, 0]  # (B, H)
 
-    # Advantages: sign determines which set each state belongs to
-    advantages = (lambda_ret - values.detach()).detach()   # (B, H) — stop grad
+    # Advantages from slow target — stable baseline that doesn't chase itself.
+    advantages = (lambda_ret - values_tgt).detach()   # (B, H) — no grad
     D_pos = advantages >= 0
     D_neg = ~D_pos
     n_pos = D_pos.float().sum().clamp_min(1.0)
@@ -454,8 +465,9 @@ def imagination_forward(self, batch, stage, cfg):
             f'{stage}/imag_policy_loss': imag_policy_loss,
             f'{stage}/adv_pos_frac':    adv_pos_frac,
             f'{stage}/mean_abs_adv':    mean_abs_adv,
-            f'{stage}/mean_value':      values.mean().detach(),
+            f'{stage}/mean_value_tgt':  values_tgt.mean().detach(),
             f'{stage}/mean_return':     lambda_ret.mean(),
+            f'{stage}/r_imag_std':      r_imag.std().detach(),
             f'{stage}/flow_mse':        dyn_aux['flow_mse'],
             f'{stage}/bootstrap_mse':   dyn_aux['bootstrap_mse'],
             f'{stage}/rms_dyn':         self.model._rms_dyn.sqrt(),
