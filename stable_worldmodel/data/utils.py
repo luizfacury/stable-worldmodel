@@ -288,6 +288,10 @@ def _episode_to_step_lists(ep: dict, ep_len: int) -> dict[str, list]:
     Specifically:
       - Tensors → NumPy arrays.
       - Image arrays in ``(N, C, H, W)`` are transposed back to ``(N, H, W, C)``.
+      - Image arrays in float dtypes (e.g. LeRobot's ``ToTensor``-normalised
+        ``[0, 1]`` floats) are rescaled to ``uint8 [0, 255]`` so downstream
+        writers (Lance JPEG encode, Video MP4 encode, HDF5 fixed-dtype
+        datasets) receive a consistent display-range integer image.
       - Scalars (e.g. flattened string columns) are repeated ``ep_len`` times.
     """
     out: dict[str, list] = {}
@@ -302,8 +306,59 @@ def _episode_to_step_lists(ep: dict, ep_len: int) -> dict[str, list]:
 
         if arr.ndim == 4 and arr.shape[1] in (1, 3):
             arr = arr.transpose(0, 2, 3, 1)
+
+        # Float image → uint8. LeRobot's ToTensor pipeline produces float32
+        # in [0, 1]; HDF5 / Lance / Video tworoom-style readers all assume
+        # uint8 HxWxC. Detect by shape (3D HWC or 4D NHWC with 1/3 channels)
+        # and float dtype, then clip-and-scale.
+        if (
+            arr.dtype.kind == 'f'
+            and arr.ndim in (3, 4)
+            and arr.shape[-1] in (1, 3)
+        ):
+            arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+
         out[col] = list(arr)
     return out
 
 
-__all__ = ['load_dataset', 'convert', 'get_cache_dir', 'ensure_dir_exists']
+class ZScoreNormalizer:
+    """Picklable z-score normalizer: returns ``((x - mean) / std).float()``.
+
+    Lives at module scope (not a closure) so it survives pickle. Required
+    when the dataset is consumed by a DataLoader using the ``spawn`` start
+    method — which LanceDataset forces on Linux for fork-safety.
+    """
+
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, x):
+        return ((x - self.mean) / self.std).float()
+
+
+def column_normalizer(dataset, source: str, target: str):
+    """Build a per-column z-score :class:`WrapTorchTransform` from dataset
+    stats. Picklable end-to-end (uses :class:`ZScoreNormalizer` rather
+    than a local closure)."""
+    # Lazy import — stable_pretraining is a training-only dep.
+    from stable_pretraining.data.transforms import WrapTorchTransform
+
+    data = torch.from_numpy(np.array(dataset.get_col_data(source)))
+    data = data[~torch.isnan(data).any(dim=1)]
+    mean = data.mean(0, keepdim=True).clone()
+    std = data.std(0, keepdim=True).clone()
+    return WrapTorchTransform(
+        ZScoreNormalizer(mean, std), source=source, target=target
+    )
+
+
+__all__ = [
+    'load_dataset',
+    'convert',
+    'get_cache_dir',
+    'ensure_dir_exists',
+    'ZScoreNormalizer',
+    'column_normalizer',
+]

@@ -1,4 +1,3 @@
-from functools import partial
 from pathlib import Path
 
 import hydra
@@ -9,8 +8,9 @@ import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
-import numpy as np
 
+from functools import partial
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.lewm.module import (
     Predictor,
     Embedder,
@@ -29,23 +29,6 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     )
     resize = dt.transforms.Resize(img_size, source=source, target=target)
     return dt.transforms.Compose(to_image, resize)
-
-
-def get_column_normalizer(dataset, source: str, target: str):
-    """Get normalizer for a specific column in the dataset."""
-    col_data = dataset.get_col_data(source)
-    data = torch.from_numpy(np.array(col_data))
-    data = data[~torch.isnan(data).any(dim=1)]
-    mean = data.mean(0, keepdim=True).clone()
-    std = data.std(0, keepdim=True).clone()
-
-    def norm_fn(x):
-        return ((x - mean) / std).float()
-
-    normalizer = dt.transforms.WrapTorchTransform(
-        norm_fn, source=source, target=target
-    )
-    return normalizer
 
 
 class SaveCkptCallback(Callback):
@@ -205,11 +188,16 @@ def run(cfg):
         pred_proj=predictor_proj,
     )
 
+    total_steps = cfg.trainer.max_epochs * len(train)
     optimizers = {
         'model_opt': {
             'modules': 'model',
             'optimizer': dict(cfg.optimizer),
-            'scheduler': {'type': 'LinearWarmupCosineAnnealingLR'},
+            'scheduler': {
+                'type': 'LinearWarmupCosineAnnealingLR',
+                'warmup_steps': max(1, int(0.01 * total_steps)),
+                'max_steps': total_steps,
+            },
             'interval': 'epoch',
         },
     }
@@ -254,11 +242,12 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
+    ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=run_dir / f'{cfg.output_model_name}_weights.ckpt',
+        ckpt_path=ckpt_path if ckpt_path.exists() else None,
     )
 
     manager()

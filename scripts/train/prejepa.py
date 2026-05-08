@@ -1,5 +1,4 @@
 from collections import OrderedDict
-from functools import partial
 from pathlib import Path
 
 import hydra
@@ -8,6 +7,8 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.callbacks import Callback
+from functools import partial
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.utils import save_pretrained
 from lightning.pytorch.loggers import WandbLogger
 from loguru import logger as logging
@@ -84,20 +85,6 @@ def get_img_preprocessor(source, target, img_size=224):
     return spt.data.transforms.Compose(
         spt.data.transforms.ToImage(**stats, source=source, target=target),
         spt.data.transforms.Resize(img_size, source=source, target=target),
-    )
-
-
-def get_column_normalizer(dataset, source, target):
-    data = torch.from_numpy(dataset.get_col_data(source)[:])
-    data = data[~torch.isnan(data).any(dim=1)]
-    mean, std = (
-        data.mean(0, keepdim=True).clone(),
-        data.std(0, keepdim=True).clone(),
-    )
-    return spt.data.transforms.WrapTorchTransform(
-        lambda x: ((x - mean) / std).float(),
-        source=source,
-        target=target,
     )
 
 
@@ -375,11 +362,12 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
+    ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=spt.data.DataModule(train=train_loader, val=val_loader),
-        ckpt_path=run_dir / f'{cfg.output_model_name}_weights.ckpt',
+        ckpt_path=ckpt_path if ckpt_path.exists() else None,
     )
     manager()
 
