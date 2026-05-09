@@ -438,6 +438,25 @@ class ParquetWriter:
         members: false
         show_source: false
 
+## **[ Replay Buffer ]**
+
+`ReplayBuffer` is an in-memory ring-storage buffer that subclasses `Dataset`
+and implements the `Writer` protocol — the same object can be filled by a
+rollout (Writer side) and iterated by a `DataLoader` (Dataset side), so
+collection and training can interleave without copying data. It evicts
+whole oldest episodes FIFO when the next write would exceed `max_steps`,
+and `dump(path, format=...)` persists current contents through any
+registered format writer.
+
+See the [online-learning guide](../guides/online_learning.md) for
+fill/sample/dump examples and a step-conditioned sampler walkthrough.
+
+::: stable_worldmodel.data.ReplayBuffer
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
 ## **[ Wrappers ]**
 
 ::: stable_worldmodel.data.GoalDataset

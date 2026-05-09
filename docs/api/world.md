@@ -38,6 +38,24 @@ world.collect("data/pusht_expert.h5", episodes=500, seed=0)
 ```
 ///
 
+/// tab | Collect into a ReplayBuffer
+```python
+import stable_worldmodel as swm
+from stable_worldmodel.data import ReplayBuffer
+
+world = swm.World("swm/PushT-v1", num_envs=8, image_shape=(64, 64))
+world.set_policy(policy)
+
+# Pass any object implementing the Writer protocol (e.g. ReplayBuffer)
+# via writer=. Mutually exclusive with path=.
+buf = ReplayBuffer(max_steps=200_000, history_len=4)
+world.collect(writer=buf, episodes=20, seed=0)
+```
+
+See the [online-learning guide](../guides/online_learning.md) for the full
+fill / sample / dump workflow.
+///
+
 /// tab | Episodic evaluation
 ```python
 results = world.evaluate(

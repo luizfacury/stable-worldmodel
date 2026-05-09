@@ -1,5 +1,6 @@
 from .utils import *  # noqa: F403
 from .dataset import *  # noqa: F403
+from .buffer import ReplayBuffer
 from .format import (
     FORMATS,
     WRITE_MODES,
@@ -44,6 +45,7 @@ __all__ = [
     'LanceDataset',
     'LanceWriter',
     'LeRobotAdapter',
+    'ReplayBuffer',
     'WRITE_MODES',
     'Writer',
     'detect_format',

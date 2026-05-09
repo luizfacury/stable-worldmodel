@@ -231,14 +231,19 @@ class World:
 
     def collect(
         self,
-        path: str | Path,
-        episodes: int,
+        path: str | Path | None = None,
+        episodes: int = 0,
         seed: int | None = None,
         options: dict | None = None,
         format: str = 'lance',
+        writer: Any = None,
     ) -> None:
-        """Roll out ``episodes`` and dump their trajectories using the writer
-        registered for ``format``.
+        """Roll out ``episodes`` and dump their trajectories.
+
+        Pass either ``path`` (a registered format writer is constructed for
+        you) **or** ``writer`` (a pre-built object implementing the
+        :class:`~stable_worldmodel.data.Writer` protocol — for example a
+        :class:`~stable_worldmodel.data.ReplayBuffer` to fill in-memory).
 
         Each info key becomes a column. Leading length-1 time dims are
         squeezed. Columns starting with ``_`` (e.g. ``_needs_flush``)
@@ -246,20 +251,33 @@ class World:
 
         Args:
             path: Output path (file or directory, depending on the format).
-                Parent dirs are auto-created.
+                Parent dirs are auto-created. Mutually exclusive with
+                ``writer``.
             episodes: Number of episodes to record.
             seed: Base seed for env resets.
             options: Reset options forwarded to ``envs.reset``.
-            format: Registered format name (default ``'lance'``). See
+            format: Registered format name (default ``'lance'``); ignored
+                when ``writer`` is provided. See
                 :func:`stable_worldmodel.data.list_formats` for available
                 writers; new formats can be added via
                 :func:`stable_worldmodel.data.register_format`.
+            writer: A pre-built writer (e.g. ``ReplayBuffer``) to fill
+                directly. Mutually exclusive with ``path``.
         """
         from tqdm import tqdm
 
         from stable_worldmodel.data.format import get_format
 
-        writer_cls = get_format(format)
+        if (path is None) == (writer is None):
+            raise ValueError(
+                'World.collect: pass exactly one of `path` or `writer`.'
+            )
+
+        if writer is None:
+            writer_cm = get_format(format).open_writer(path)
+        else:
+            writer_cm = writer
+
         buffers = [defaultdict(list) for _ in range(self.num_envs)]
 
         def on_step(world):
@@ -282,7 +300,7 @@ class World:
                     buffers[i][col].append(val)
 
         with (
-            writer_cls.open_writer(path) as writer,
+            writer_cm as w,
             tqdm(total=episodes, desc='Recording') as pbar,
         ):
 
@@ -301,7 +319,7 @@ class World:
                     pbar.update(1)
                     yield ep
 
-            writer.write_episodes(episode_iter())
+            w.write_episodes(episode_iter())
 
     def _run(
         self,
