@@ -16,7 +16,7 @@ benchmark:
 # Required fields per entry:
 #   name         – label shown in the output table
 #   format       – hdf5 | lance | video
-#   path         – absolute path to the local file/directory (or s3:// URI)
+#   path         – filename relative to the SWM datasets cache dir, absolute path, or s3:// URI
 #   keys_to_load – list of columns to read each step
 #
 # Optional fields:
@@ -32,14 +32,14 @@ datasets:
   - name: pusht
     format: lance
     source: local
-    path: /home/ql2867/vast/.stable_worldmodel/datasets/pusht_expert_train.lance
+    path: pusht_expert_train.lance
     keys_to_load: [pixels, action, proprio]
     keys_to_cache: [action, proprio]
 
   - name: pusht
     format: hdf5
     source: local
-    path: /home/ql2867/vast/.stable_worldmodel/datasets/pusht_expert_train.h5
+    path: pusht_expert_train.h5
     keys_to_load: [pixels, action, proprio]
     keys_to_cache: [action, proprio]
 

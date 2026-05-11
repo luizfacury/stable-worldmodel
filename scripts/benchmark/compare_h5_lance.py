@@ -21,6 +21,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from stable_worldmodel.data import HDF5Dataset, LanceDataset
+from stable_worldmodel.data.utils import get_cache_dir
 
 try:
     from stable_worldmodel.data import VideoDataset
@@ -80,7 +81,10 @@ def _fmt_bytes(n: int) -> str:
 def _make_dataset(ds_cfg: DictConfig, keys_to_cache: list[str], common: dict):
     fmt = ds_cfg.format.lower()
     source = ds_cfg.get('source', 'local')
-    path = str(ds_cfg.path)
+    raw_path = Path(ds_cfg.path)
+    if source == 'local' and not raw_path.is_absolute():
+        raw_path = get_cache_dir(sub_folder='datasets') / raw_path
+    path = str(raw_path)
 
     if fmt == 'lance':
         kwargs: dict = {}
@@ -185,7 +189,10 @@ def main(cfg: DictConfig) -> None:
                 print(f'  (skipping {label.strip()}: {e})', flush=True)
                 continue
             sps, ms_step = _bench_one(label, ds, b_cfg)
-            size = _local_size(Path(ds_cfg.path)) if source == 'local' else 0
+            raw_path = Path(ds_cfg.path)
+            if not raw_path.is_absolute():
+                raw_path = get_cache_dir(sub_folder='datasets') / raw_path
+            size = _local_size(raw_path) if source == 'local' else 0
             results.append(
                 (name, fmt, source, cache_label, sps, ms_step, size)
             )
