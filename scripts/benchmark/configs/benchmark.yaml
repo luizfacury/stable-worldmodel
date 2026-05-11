@@ -32,7 +32,7 @@ datasets:
   - name: pusht
     format: lance
     source: local
-    path: /home/ql2867/vast/.stable_worldmodel/datasets/pusht_expert_train
+    path: /home/ql2867/vast/.stable_worldmodel/datasets/pusht_expert_train.lance
     keys_to_load: [pixels, action, proprio]
     keys_to_cache: [action, proprio]
 
