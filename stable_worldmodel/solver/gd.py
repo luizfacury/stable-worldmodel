@@ -9,9 +9,9 @@ import torch
 from gymnasium.spaces import Box
 from loguru import logger as logging
 
-from stable_worldmodel.protocols import Costable
 from stable_worldmodel.solver.utils import prepare_init_action
 from .callbacks import Callback
+from .solver import Costable
 
 
 class GradientSolver(torch.nn.Module):

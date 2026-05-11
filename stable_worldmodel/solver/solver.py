@@ -4,6 +4,38 @@ import torch
 import gymnasium as gym
 
 
+class Costable(Protocol):
+    """Protocol for world model cost functions."""
+
+    def criterion(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the cost criterion for action candidates.
+
+        Args:
+            info_dict: Dictionary containing environment state information.
+            action_candidates: Tensor of proposed actions.
+
+        Returns:
+            A tensor of cost values for each action candidate.
+        """
+        ...
+
+    def get_cost(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:  # pragma: no cover
+        """Compute cost for given action candidates based on info dictionary.
+
+        Args:
+            info_dict: Dictionary containing environment state information.
+            action_candidates: Tensor of proposed actions.
+
+        Returns:
+            A tensor of cost values for each action candidate.
+        """
+        ...
+
+
 @runtime_checkable
 class Solver(Protocol):
     """Protocol for model-based planning solvers."""
