@@ -8,11 +8,12 @@ hydra:
 
 # --- Run ---
 output_model_name: tdmpc2_output
-subdir: null
+subdir: pusht
 seed: 1
 
 # --- Data ---
-dataset_name: pusht_expert_train_v2
+dataset_name: pusht
+goal_obs_key: state
 cache_dir: null
 batch_size: 256
 num_workers: 16
@@ -46,18 +47,12 @@ wm:
   entropy_coef: 1e-4
   name: tdmpc2
 
-  # Reward Scales
-  # reacher: r=-dist ∈[-0.44,0], worst-case Q symlog≈-3.7
-  # tworoom: r=-dist/260 ∈[-1,0],  worst-case Q symlog≈-4.2
-  # vmin=-5 covers both; vmax=2 buffers early-training Q drift above 0.
   num_bins: 101
-  vmin: -5
+  vmin: -6
   vmax: 2
 
-  # --- DYNAMIC ENCODING ---
-  # Add modalities as needed (e.g., proprio, state, pixels etc.)
   encoding:
-    observation: 128
+    state: 128
 
 # --- Optimizer ---
 optimizer:
@@ -73,14 +68,6 @@ trainer:
   accelerator: gpu
   precision: 16-mixed
   gradient_clip_val: 20.0
-
-goal_gamma: 0.99
-
-goal_probabilities:
-  random: 0.2
-  geometric_future: 0.6
-  uniform_future: 0.1
-  current: 0.1
 
 # --- Logging ---
 wandb:

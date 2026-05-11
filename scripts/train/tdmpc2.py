@@ -44,28 +44,6 @@ class ModelObjectCallBack(Callback):
 
 
 
-class GoalInjectTransform:
-    """Injects the episode goal (last observation of the episode) into each sample.
-
-    Uses a pre-computed table: goals_per_step[i] = last obs of the episode that
-    contains timestep i.  Requires 'ep_offset' to be loaded so we can look up
-    which episode a sequence belongs to.
-    """
-
-    def __init__(self, goals_per_step: torch.Tensor):
-        self.goals_per_step = goals_per_step  # (N, obs_dim)
-
-    def __call__(self, x: dict) -> dict:
-        ep_offset = x['ep_offset']
-        if isinstance(ep_offset, torch.Tensor):
-            idx = int(ep_offset.flatten()[0].item())
-        else:
-            idx = int(ep_offset.flat[0])
-        goal = self.goals_per_step[idx]        # (obs_dim,)
-        T = ep_offset.shape[0]
-        x['goal'] = goal.unsqueeze(0).expand(T, -1).clone()
-        return x
-
 
 def get_column_normalizer(dataset, source, target):
     """
@@ -133,13 +111,10 @@ def run(cfg):
         raise ValueError('No encoding modalities defined in cfg.wm.encoding!')
 
     use_pixels = 'pixels' in encoding_keys
-    use_goal = 'goal' in encoding_keys
-    # 'goal' is computed from episode boundaries, not loaded directly from the dataset
-    extra_keys = [k for k in encoding_keys if k not in ('pixels', 'goal')]
+    goal_obs_key = cfg.get('goal_obs_key')  # if set, concatenate episode goal into this key
+    extra_keys = [k for k in encoding_keys if k != 'pixels']
 
-    keys_to_load = [k for k in encoding_keys if k != 'goal'] + ['action', 'reward']
-    if use_goal:
-        keys_to_load += ['ep_offset']
+    keys_to_load = list(encoding_keys) + ['action', 'reward']
 
     base_dataset = swm.data.HDF5Dataset(
         cfg.dataset_name,
@@ -148,24 +123,24 @@ def run(cfg):
         cache_dir=cfg.get('cache_dir'),
     )
 
-    # Pre-compute goal for every timestep when goal conditioning is requested.
-    # goal[i] = last observation of the episode containing timestep i,
-    # derived from the ep_offset and ep_len metadata stored in the dataset.
-    if use_goal:
-        goal_obs_key = cfg.get('goal_obs_key')
-        if goal_obs_key is None:
+    if goal_obs_key is not None:
+        if goal_obs_key not in encoding_keys:
             raise ValueError(
-                'cfg.goal_obs_key must specify which observation column to use as the '
-                'goal (e.g. "state") when "goal" is present in cfg.wm.encoding.'
+                f'cfg.goal_obs_key="{goal_obs_key}" must be one of the encoding keys {encoding_keys}.'
             )
         _raw_obs = base_dataset.get_col_data(goal_obs_key)[:]
         _ep_off = base_dataset.get_col_data('ep_offset')[:].flatten().astype(int)
         _ep_len = base_dataset.get_col_data('ep_len')[:].flatten().astype(int)
         _goal_idx = np.clip(_ep_off + _ep_len - 1, 0, len(_raw_obs) - 1)
-        goals_per_step = torch.from_numpy(_raw_obs[_goal_idx]).float()
+        goals_by_step = np.empty_like(_raw_obs)
+        for _ep, (_off, _len) in enumerate(zip(_ep_off.tolist(), _ep_len.tolist())):
+            goals_by_step[_off:_off + _len] = _raw_obs[_goal_idx[_ep]]
+        base_dataset._cache[goal_obs_key] = np.concatenate(
+            [base_dataset._cache[goal_obs_key], goals_by_step], axis=-1
+        )
         logging.info(
-            f'Goal conditioning enabled: goal = last obs of each episode '
-            f'(source key: "{goal_obs_key}", dim: {goals_per_step.shape[-1]})'
+            f'Goal augmentation: appended last obs of each episode to "{goal_obs_key}" '
+            f'(dim {_raw_obs.shape[-1]} → {base_dataset._cache[goal_obs_key].shape[-1]})'
         )
 
     raw_actions = base_dataset.get_col_data('action')[:]
@@ -188,10 +163,10 @@ def run(cfg):
         cfg.extra_dims = {'action': cfg.action_dim}
 
         for key in extra_keys:
-            cfg.extra_dims[key] = base_dataset.get_dim(key)
-
-        if use_goal:
-            cfg.extra_dims['goal'] = base_dataset.get_dim(goal_obs_key)
+            if goal_obs_key is not None and key == goal_obs_key:
+                cfg.extra_dims[key] = base_dataset._cache[key].shape[-1]
+            else:
+                cfg.extra_dims[key] = base_dataset.get_dim(key)
 
     transforms = []
     if use_pixels:
@@ -200,20 +175,20 @@ def run(cfg):
         )
 
     for key in extra_keys:
-        transforms.append(get_column_normalizer(base_dataset, key, key))
-
-    if use_goal:
-        transforms.append(GoalInjectTransform(goals_per_step))
-        _goal_clean = goals_per_step[~torch.isnan(goals_per_step).any(dim=1)]
-        _g_mean = _goal_clean.mean(0).clone()
-        _g_std = _goal_clean.std(0).clone() + 1e-2
-        transforms.append(
-            spt.data.transforms.WrapTorchTransform(
-                lambda x, m=_g_mean, s=_g_std: ((x - m.to(x.device)) / s.to(x.device)).float(),
-                source='goal',
-                target='goal',
+        if goal_obs_key is not None and key == goal_obs_key:
+            aug_data = torch.from_numpy(base_dataset._cache[key]).float()
+            aug_clean = aug_data[~torch.isnan(aug_data).any(dim=1)]
+            _mean = aug_clean.mean(0).clone()
+            _std = aug_clean.std(0).clone() + 1e-2
+            transforms.append(
+                spt.data.transforms.WrapTorchTransform(
+                    lambda x, m=_mean, s=_std: ((x - m.to(x.device)) / s.to(x.device)).float(),
+                    source=key,
+                    target=key,
+                )
             )
-        )
+        else:
+            transforms.append(get_column_normalizer(base_dataset, key, key))
 
     base_dataset.transform = spt.data.transforms.Compose(*transforms)
 

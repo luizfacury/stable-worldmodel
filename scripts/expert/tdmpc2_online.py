@@ -57,6 +57,12 @@ from stable_worldmodel.solver.cem import CEMSolver
 from stable_worldmodel.policy import WorldModelPolicy, PlanConfig
 from stable_worldmodel.wm.tdmpc2 import TDMPC2, tdmpc2_forward
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 TASK_REGISTRY: dict[str, dict[str, int]] = {
     "cheetah": {
         "run":           3_000_000,
@@ -73,7 +79,7 @@ TASK_REGISTRY: dict[str, dict[str, int]] = {
     },
     "walker": {
         "stand":         3_000_000,
-        "walk":          3_000_000,
+        "walk":          1_000_000,
         "run":           3_000_000,
         "walk-backward": 3_000_000,
         "lie_down":      3_000_000,
@@ -83,7 +89,7 @@ TASK_REGISTRY: dict[str, dict[str, int]] = {
     },
     "hopper": {
         "stand":         3_000_000,
-        "hop":           3_000_000,
+        "hop":           1_500_000,
         "hop-backward":  3_000_000,
         "flip":          3_000_000,
         "flip-backward": 3_000_000,
@@ -106,10 +112,15 @@ TASK_REGISTRY: dict[str, dict[str, int]] = {
         "walk":  5_000_000,
         "run":   5_000_000,
     },
+    "cartpole": {"balance": 1_000_000},
+    "pendulum": {"swingup": 1_000_000},
 }
 
 
 ENC_KEY = "observation"
+
+# Domains whose gymnasium wrappers have a fixed task and don't accept a task kwarg
+_TASKLESS_DOMAINS = {"cartpole", "pendulum", "ballincup"}
 
 SEED_STEPS = 5_000
 EVAL_FREQ  = 50_000
@@ -172,7 +183,8 @@ def make_env(gym_id: str, task: str | None = None) -> gym.Env:
     Note: the correct library fix is DMControlWrapper.step returning
     truncated=step.last() — this is a workaround until that lands.
     """
-    env_kwargs = {"task": task} if task is not None else {}
+    domain = gym_id.split("/")[-1].replace("DMControl-v0", "").lower()
+    env_kwargs = {"task": task} if (task is not None and domain not in _TASKLESS_DOMAINS) else {}
     env = gym.make(gym_id, **env_kwargs)
 
     max_steps = _get_max_episode_steps(env)
@@ -274,9 +286,9 @@ class SequenceReplayBuffer:
             obs_b[i, :n] = ep["obs"][start:end]
             act_b[i, :n] = ep["act"][start:end]
             rew_b[i, :n] = ep["rew"][start:end]
-        return {ENC_KEY:  torch.as_tensor(obs_b, device=self.device),
-                "action": torch.as_tensor(act_b, device=self.device),
-                "reward": torch.as_tensor(rew_b, device=self.device)}
+        return {ENC_KEY:  torch.as_tensor(obs_b).pin_memory().to(self.device, non_blocking=True),
+                "action": torch.as_tensor(act_b).pin_memory().to(self.device, non_blocking=True),
+                "reward": torch.as_tensor(rew_b).pin_memory().to(self.device, non_blocking=True)}
 
     def __len__(self) -> int:
         return self._total
@@ -333,10 +345,13 @@ def evaluate(model: TDMPC2, gym_id: str, task: str,
     return float(np.mean(rewards))
 
 
-def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
+def train_task(domain: str, task: str, total_steps: int, base_dir: Path,
+               use_wandb: bool = False, seed: int = 42):
     gym_id   = f"swm/{domain.capitalize()}DMControl-v0"
     save_dir = base_dir / f"{domain}_{task}"
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    use_wandb = use_wandb and WANDB_AVAILABLE
 
     logging.info(f"\n{'='*60}")
     logging.info(f"TD-MPC2 | {domain}-{task} | {total_steps:,} steps | device={DEVICE}")
@@ -360,6 +375,23 @@ def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
     logging.info(f"  obs_dim={obs_dim} | action_dim={action_dim} | "
                  f"horizon={horizon} | discount={discount:.4f} | "
                  f"max_ep_steps={max_ep_steps}")
+
+    if use_wandb:
+        wandb.init(
+            project="tdmpc2-online",
+            name=f"{domain}_{task}_seed{seed}",
+            config={
+                "domain": domain,
+                "task":   task,
+                "total_steps": total_steps,
+                "obs_dim":    obs_dim,
+                "action_dim": action_dim,
+                "discount":   discount,
+                "seed":       seed,
+                **{f"wm/{k}": v for k, v in dict(cfg.wm).items()},
+            },
+            sync_tensorboard=False,
+        )
 
     model = TDMPC2(cfg).to(DEVICE)
     model.eval()
@@ -405,6 +437,9 @@ def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
                 f"[{domain}-{task}] step={step:,} | "
                 f"ep_reward={ep_reward:.2f} | ep_len={ep_steps}"
             )
+            if use_wandb:
+                wandb.log({"rollout/ep_reward": ep_reward,
+                           "rollout/ep_len":    ep_steps}, step=step)
             obs, _    = env.reset()
             obs       = obs.astype(np.float32)
             ep_reward, ep_steps = 0.0, 0
@@ -422,6 +457,11 @@ def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
                     f"val={metrics['value_loss']:.4f} | "
                     f"pi={metrics['policy_loss']:.4f}"
                 )
+                if use_wandb:
+                    wandb.log({"train/loss":        metrics["loss"],
+                               "train/reward_loss": metrics["reward_loss"],
+                               "train/value_loss":  metrics["value_loss"],
+                               "train/policy_loss": metrics["policy_loss"]}, step=step)
 
         if step % SAVE_FREQ == 0 and step >= SEED_STEPS:
             save_checkpoint(model, save_dir, tag=f"step_{step}")
@@ -431,6 +471,8 @@ def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
             logging.info(
                 f"[{domain}-{task}] *** EVAL step={step:,} | mean_reward={eval_r:.2f} ***"
             )
+            if use_wandb:
+                wandb.log({"eval/mean_reward": eval_r}, step=step)
             if eval_r > best_eval:
                 best_eval = eval_r
                 save_checkpoint(model, save_dir, tag="best")
@@ -442,6 +484,8 @@ def train_task(domain: str, task: str, total_steps: int, base_dir: Path):
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if use_wandb:
+        wandb.finish()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -459,6 +503,8 @@ def main():
                         help="List all available domain/task combinations and exit.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed.")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Log metrics to Weights & Biases (requires: pip install wandb)")
     args = parser.parse_args()
 
     if args.list:
@@ -496,7 +542,8 @@ def main():
         if args.steps is not None:
             total_steps = args.steps
         train_task(domain=domain, task=task,
-                   total_steps=total_steps, base_dir=base_dir)
+                   total_steps=total_steps, base_dir=base_dir,
+                   use_wandb=args.wandb, seed=args.seed)
 
 
 if __name__ == "__main__":

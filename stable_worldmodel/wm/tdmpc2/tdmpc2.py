@@ -261,7 +261,7 @@ class TDMPC2(nn.Module):
                     torch.cat([z, prefix_actions[:, t].to(device)], dim=-1)
                 )
 
-        num_trajs = self.cfg.wm.get('num_pi_trajs', 1)
+        num_trajs = self.cfg.get('num_pi_trajs', 1)
         return self.rollout(z, horizon, num_trajs)  # (B, horizon, action_dim)
 
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
