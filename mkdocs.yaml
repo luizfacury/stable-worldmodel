@@ -24,8 +24,13 @@ nav:
       - envs/dmc.md
       - envs/ogb.md
       - envs/tworoom.md
+      - envs/gymnasium_robotics.md
+      - envs/gymnasium_control.md
+      - envs/craftax.md
+      - envs/ale.md
   - Guides:
       - guides/checkpoints.md
+      - guides/online_learning.md
   - cli.md
   # - Tutorial:
   #     - tutorial/collect_data.md

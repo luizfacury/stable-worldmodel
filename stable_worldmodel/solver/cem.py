@@ -11,6 +11,7 @@ from loguru import logger as logging
 
 from stable_worldmodel.protocols import Costable
 from stable_worldmodel.solver.utils import prepare_init_action
+from .callbacks import Callback
 
 
 class CEMSolver:
@@ -37,6 +38,7 @@ class CEMSolver:
         topk: int = 30,
         device: str | torch.device = 'cpu',
         seed: int = 1234,
+        callbacks: list[Callback] | None = None,
     ) -> None:
         self.model = model
         self.batch_size = batch_size
@@ -46,6 +48,11 @@ class CEMSolver:
         self.topk = topk
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
+        self.callbacks = list(callbacks) if callbacks else []
+        try:
+            self._dtype = next(model.parameters()).dtype
+        except (AttributeError, StopIteration):
+            self._dtype = torch.float32
 
     def configure(
         self, *, action_space: gym.Space, n_envs: int, config: Any
@@ -77,22 +84,36 @@ class CEMSolver:
         """Planning horizon in timesteps."""
         return self._config.horizon
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
     def __call__(self, *args: Any, **kwargs: Any) -> dict:
         """Make solver callable, forwarding to solve()."""
         return self.solve(*args, **kwargs)
 
     def init_action_distrib(
-        self, actions: torch.Tensor
+        self, n_envs: int, actions: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Initialize the action distribution parameters (mean and variance)."""
-        assert actions.shape == (self.n_envs, self.horizon, self.action_dim), (
-            f'Expected actions shape ({self.n_envs}, {self.horizon}, {self.action_dim}), '
-            f'got {tuple(actions.shape)}'
-        )
         var = self.var_scale * torch.ones(
-            [self.n_envs, self.horizon, self.action_dim]
+            [n_envs, self.horizon, self.action_dim], dtype=self.dtype
         )
-        return actions, var
+        mean = (
+            torch.zeros([n_envs, 0, self.action_dim], dtype=self.dtype)
+            if actions is None
+            else actions
+        )
+
+        remaining = self.horizon - mean.shape[1]
+        if remaining > 0:
+            device = mean.device
+            new_mean = torch.zeros(
+                [n_envs, remaining, self.action_dim], dtype=self.dtype
+            )
+            mean = torch.cat([mean, new_mean], dim=1).to(device)
+
+        return mean, var
 
     @torch.inference_mode()
     def solve(
@@ -106,22 +127,26 @@ class CEMSolver:
             'var': [],  # History of vars
         }
 
+        # Batch size is taken from info_dict so callers can solve for a subset of envs
+        total_envs = len(next(iter(info_dict.values())))
+
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
             self.model,
             info_dict,
             init_action,
             self.horizon,
-            n_envs=self.n_envs,
+            n_envs=total_envs,
             action_dim=self.action_dim,
         )
 
         # -- initialize the action distribution globally
-        mean, var = self.init_action_distrib(init_action)
+        mean, var = self.init_action_distrib(total_envs, init_action)
         mean = mean.to(self.device)
         var = var.to(self.device)
 
-        total_envs = self.n_envs
+        for cb in self.callbacks:
+            cb.reset()
 
         # --- Iterate over batches ---
         for start_idx in range(0, total_envs, self.batch_size):
@@ -135,15 +160,19 @@ class CEMSolver:
             # Expand Info Dict for current batch
             expanded_infos = {}
             for k, v in info_dict.items():
-                # v is shape (n_envs, ...)
-                # Slice batch
                 v_batch = v[start_idx:end_idx]
                 if torch.is_tensor(v):
-                    # Add sample dim: (batch, 1, ...)
-                    v_batch = v_batch.unsqueeze(1)
-                    # Expand: (batch, num_samples, ...)
-                    v_batch = v_batch.expand(
-                        current_bs, self.num_samples, *v_batch.shape[2:]
+                    target_dtype = (
+                        self.dtype if v_batch.is_floating_point() else None
+                    )
+                    v_batch = (
+                        v_batch.to(device=self.device, dtype=target_dtype)
+                        .unsqueeze(1)
+                        .expand(
+                            current_bs,
+                            self.num_samples,
+                            *v_batch.shape[1:],
+                        )
                     )
                 elif isinstance(v, np.ndarray):
                     v_batch = np.repeat(
@@ -154,6 +183,9 @@ class CEMSolver:
             # Optimization Loop
             final_batch_cost = None
 
+            for cb in self.callbacks:
+                cb.start_batch()
+
             for step in range(self.n_steps):
                 # Sample action sequences: (Batch, Num_Samples, Horizon, Dim)
                 candidates = torch.randn(
@@ -163,6 +195,7 @@ class CEMSolver:
                     self.action_dim,
                     generator=self.torch_gen,
                     device=self.device,
+                    dtype=self.dtype,
                 )
 
                 # Scale and shift: (Batch, N, H, D) * (Batch, 1, H, D) + (Batch, 1, H, D)
@@ -173,10 +206,8 @@ class CEMSolver:
                 # Force the first sample to be the current mean
                 candidates[:, 0] = batch_mean
 
-                current_info = expanded_infos.copy()
-
                 # Evaluate candidates
-                costs = self.model.get_cost(current_info, candidates)
+                costs = self.model.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (
                     f'Expected cost to be a torch.Tensor, got {type(costs)}'
@@ -208,8 +239,24 @@ class CEMSolver:
                 topk_candidates = candidates[batch_indices, topk_inds]
 
                 # Update Mean and Variance based on Top-K
+                prev_mean = batch_mean
+                prev_var = batch_var
                 batch_mean = topk_candidates.mean(dim=1)
                 batch_var = topk_candidates.std(dim=1)
+
+                for cb in self.callbacks:
+                    cb(
+                        step=step,
+                        candidates=candidates,
+                        costs=costs,
+                        topk_vals=topk_vals,
+                        topk_inds=topk_inds,
+                        topk_candidates=topk_candidates,
+                        mean=batch_mean,
+                        var=batch_var,
+                        prev_mean=prev_mean,
+                        prev_var=prev_var,
+                    )
 
                 # Update final cost for logging
                 # We average the cost of the top elites
@@ -225,6 +272,12 @@ class CEMSolver:
         outputs['actions'] = mean.detach().cpu()
         outputs['mean'] = [mean.detach().cpu()]
         outputs['var'] = [var.detach().cpu()]
+
+        if self.callbacks:
+            outputs['callbacks'] = {}
+            for cb in self.callbacks:
+                cb.end_solve()
+                outputs['callbacks'][cb.output_key] = cb.history
 
         print(f'CEM solve time: {time.time() - start_time:.4f} seconds')
         return outputs

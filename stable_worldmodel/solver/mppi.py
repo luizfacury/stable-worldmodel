@@ -49,6 +49,10 @@ class MPPISolver:
         self.temperature = temperature
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
+        try:
+            self._dtype = next(model.parameters()).dtype
+        except (AttributeError, StopIteration):
+            self._dtype = torch.float32
 
     def configure(
         self, *, action_space: gym.Space, n_envs: int, config: Any
@@ -80,22 +84,36 @@ class MPPISolver:
         """Planning horizon in timesteps."""
         return self._config.horizon
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
     def __call__(self, *args: Any, **kwargs: Any) -> dict:
         """Make solver callable, forwarding to solve()."""
         return self.solve(*args, **kwargs)
 
     def init_action_distrib(
-        self, actions: torch.Tensor
+        self, n_envs: int, actions: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Initialize the action distribution parameters (mean and variance)."""
-        assert actions.shape == (self.n_envs, self.horizon, self.action_dim), (
-            f'Expected actions shape ({self.n_envs}, {self.horizon}, {self.action_dim}), '
-            f'got {tuple(actions.shape)}'
-        )
         var = self.var_scale * torch.ones(
-            [self.n_envs, self.horizon, self.action_dim]
+            [n_envs, self.horizon, self.action_dim], dtype=self.dtype
         )
-        return actions, var
+        mean = (
+            torch.zeros([n_envs, 0, self.action_dim], dtype=self.dtype)
+            if actions is None
+            else actions
+        )
+
+        remaining = self.horizon - mean.shape[1]
+        if remaining > 0:
+            device = mean.device
+            new_mean = torch.zeros(
+                [n_envs, remaining, self.action_dim], dtype=self.dtype
+            )
+            mean = torch.cat([mean, new_mean], dim=1).to(device)
+
+        return mean, var
 
     @torch.inference_mode()
     def solve(
@@ -109,22 +127,23 @@ class MPPISolver:
             'var': [],
         }
 
+        # Batch size is taken from info_dict so callers can solve for a subset of envs
+        total_envs = len(next(iter(info_dict.values())))
+
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
             self.model,
             info_dict,
             init_action,
             self.horizon,
-            n_envs=self.n_envs,
+            n_envs=total_envs,
             action_dim=self.action_dim,
         )
 
         # -- initialize the action distribution globally
-        mean, var = self.init_action_distrib(init_action)
+        mean, var = self.init_action_distrib(total_envs, init_action)
         mean = mean.to(self.device)
         var = var.to(self.device)
-
-        total_envs = self.n_envs
 
         # --- Iterate over batches ---
         for start_idx in range(0, total_envs, self.batch_size):
@@ -135,16 +154,19 @@ class MPPISolver:
             batch_mean = mean[start_idx:end_idx]
             batch_var = var[start_idx:end_idx]
 
-            # Expand Info Dict for current batch (Same as CEM)
             expanded_infos = {}
             for k, v in info_dict.items():
                 v_batch = v[start_idx:end_idx]
                 if torch.is_tensor(v):
-                    # Add sample dim: (batch, 1, ...)
-                    v_batch = v_batch.unsqueeze(1)
-                    # Expand: (batch, num_samples, ...)
-                    v_batch = v_batch.expand(
-                        current_bs, self.num_samples, *v_batch.shape[2:]
+                    target_dtype = (
+                        self.dtype if v_batch.is_floating_point() else None
+                    )
+                    v_batch = (
+                        v_batch.to(device=self.device, dtype=target_dtype)
+                        .unsqueeze(1)
+                        .expand(
+                            current_bs, self.num_samples, *v_batch.shape[1:]
+                        )
                     )
                 elif isinstance(v, np.ndarray):
                     v_batch = np.repeat(
@@ -164,6 +186,7 @@ class MPPISolver:
                     self.action_dim,
                     generator=self.torch_gen,
                     device=self.device,
+                    dtype=self.dtype,
                 )
 
                 # MPPI Logic: candidates = mean + noise * sigma
@@ -174,7 +197,6 @@ class MPPISolver:
                 # Force the first sample to be the current mean (Zero noise)
                 candidates[:, 0] = batch_mean
 
-                # Evaluate candidates
                 costs = self.model.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (

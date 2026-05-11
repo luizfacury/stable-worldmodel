@@ -7,8 +7,6 @@ world:
   env_name: swm/ReacherDMControl-v0
   num_envs: ${eval.num_eval}
   max_episode_steps: ??? # make sure it's >= eval_budget
-  history_size: 1
-  frame_skip: 1
   task: qpos_match
 
 dataset:
@@ -30,7 +28,7 @@ eval:
   goal_offset_steps: 25
   eval_budget: 50
   img_size: 224
-  dataset_name: dmc/reacher_random
+  dataset_name: dmc/reacher_random.h5
   callables:
     # -- set state
     - method: set_state

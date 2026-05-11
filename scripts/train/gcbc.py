@@ -1,12 +1,12 @@
 import os
 from collections import OrderedDict
-from pathlib import Path
 
 import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
 from lightning.pytorch.callbacks import Callback
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.utils import save_pretrained
 from lightning.pytorch.loggers import WandbLogger
 from loguru import logger as logging
@@ -34,22 +34,6 @@ def get_data(cfg):
             spt.data.transforms.Resize(img_size, source=key, target=target),
         )
 
-    def get_column_normalizer(dataset, source: str, target: str):
-        """Get normalizer for a specific column in the dataset."""
-        data = torch.from_numpy(dataset.get_col_data(source)[:])
-        data = data[~torch.isnan(data).any(dim=1)]
-        mean = data.mean(0, keepdim=True).clone()
-        std = data.std(0, keepdim=True).clone()
-
-        def norm_fn(x):
-            return ((x - mean) / std).float()
-
-        normalizer = spt.data.transforms.WrapTorchTransform(
-            norm_fn, source=source, target=target
-        )
-
-        return normalizer
-
     cache_dir = None
     if not hasattr(cfg, 'local_cache_dir'):
         cache_dir = os.environ.get('SLURM_TMPDIR', None)
@@ -61,7 +45,7 @@ def get_data(cfg):
         keys_to_load.append('proprio')
         keys_to_cache.append('proprio')
 
-    dataset = swm.data.HDF5Dataset(
+    dataset = swm.data.load_dataset(
         cfg.dataset_name,
         num_steps=cfg.n_steps,
         frameskip=cfg.frameskip,
@@ -332,9 +316,7 @@ def setup_pl_logger(cfg):
 class SaveCkptCallback(Callback):
     """Callback to save model checkpoint after each epoch using save_pretrained."""
 
-    def __init__(
-        self, run_name, cfg, epoch_interval: int = 1
-    ):
+    def __init__(self, run_name, cfg, epoch_interval: int = 1):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
@@ -352,7 +334,12 @@ class SaveCkptCallback(Callback):
                 self._save(pl_module.model, trainer.current_epoch + 1)
 
     def _save(self, model, epoch):
-        save_pretrained(model, run_name=self.run_name, config=self.cfg, filename=f'weights_epoch_{epoch}.pt')
+        save_pretrained(
+            model,
+            run_name=self.run_name,
+            config=self.cfg,
+            filename=f'weights_epoch_{epoch}.pt',
+        )
 
 
 # ============================================================================

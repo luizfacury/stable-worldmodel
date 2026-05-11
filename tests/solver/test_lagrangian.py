@@ -444,8 +444,7 @@ def test_persist_multipliers_warm_starts():
     )
     configure(solver, action_dim=4, n_envs=2, horizon=4, action_block=1)
 
-    out1 = solver.solve({})
-    _lambdas_after_first = out1['lambdas'].clone()
+    solver.solve({})
 
     out2 = solver.solve({})
     lambdas_after_second = out2['lambdas']

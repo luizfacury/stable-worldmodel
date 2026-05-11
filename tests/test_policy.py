@@ -338,6 +338,8 @@ class MockSolver:
         self._action_space = None
         self._n_envs = 1
         self._config = None
+        self.call_count = 0
+        self.last_batch_size = None
 
     def configure(self, *, action_space, n_envs, config):
         self.configured = True
@@ -359,10 +361,13 @@ class MockSolver:
 
     def solve(self, info_dict, init_action=None):
         action_dim = self._action_space.shape[0]
+        batch = (
+            len(next(iter(info_dict.values()))) if info_dict else self._n_envs
+        )
+        self.call_count += 1
+        self.last_batch_size = batch
         return {
-            'actions': torch.zeros(
-                self._n_envs, self._config.horizon, action_dim
-            )
+            'actions': torch.zeros(batch, self._config.horizon, action_dim)
         }
 
     def __call__(self, info_dict, init_action=None):
@@ -399,6 +404,7 @@ def test_worldmodel_policy_set_env():
     mock_env = MagicMock()
     mock_env.num_envs = 4
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     assert solver.configured
@@ -414,6 +420,7 @@ def test_worldmodel_policy_set_env_no_num_envs():
 
     mock_env = MagicMock(spec=[])  # No num_envs attribute
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     assert solver.n_envs == 1  # Default
@@ -428,6 +435,7 @@ def test_worldmodel_policy_get_action():
     mock_env = MagicMock()
     mock_env.num_envs = 1
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     info = {
@@ -448,6 +456,7 @@ def test_worldmodel_policy_get_action_uses_buffer():
     mock_env = MagicMock()
     mock_env.num_envs = 1
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     info = {
@@ -458,11 +467,11 @@ def test_worldmodel_policy_get_action_uses_buffer():
     # First call should plan
     policy.get_action(info)
     # Buffer should have receding_horizon - 1 actions left
-    assert len(policy._action_buffer) == 1
+    assert len(policy._action_buffer[0]) == 1
 
     # Second call should use buffer (no new planning)
     policy.get_action(info)
-    assert len(policy._action_buffer) == 0
+    assert len(policy._action_buffer[0]) == 0
 
 
 def test_worldmodel_policy_get_action_with_process():
@@ -475,6 +484,7 @@ def test_worldmodel_policy_get_action_with_process():
     mock_env = MagicMock()
     mock_env.num_envs = 1
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     info = {
@@ -491,7 +501,7 @@ def test_worldmodel_policy_no_env_raises():
     solver = MockSolver()
     config = PlanConfig(horizon=10, receding_horizon=2)
     policy = WorldModelPolicy(solver=solver, config=config)
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, AttributeError)):
         policy.get_action({'pixels': np.array([1.0]), 'goal': np.array([1.0])})
 
 
@@ -528,6 +538,7 @@ def test_worldmodel_policy_warm_start():
     mock_env = MagicMock()
     mock_env.num_envs = 1
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     info = {
@@ -541,6 +552,52 @@ def test_worldmodel_policy_warm_start():
     assert policy._next_init is not None
 
 
+def test_worldmodel_policy_selective_replan():
+    """Only envs with empty buffers trigger re-planning; others keep their plan."""
+    solver = MockSolver()
+    config = PlanConfig(
+        horizon=10, receding_horizon=3, action_block=1, warm_start=True
+    )
+    policy = WorldModelPolicy(solver=solver, config=config)
+
+    mock_env = MagicMock()
+    mock_env.num_envs = 2
+    mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2, 2))
+    mock_env.single_action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    policy.set_env(mock_env)
+
+    info = {
+        'pixels': np.random.rand(2, 1, 64, 64, 3).astype(np.float32),
+        'goal': np.random.rand(2, 1, 64, 64, 3).astype(np.float32),
+    }
+
+    # First call: both envs have empty buffers -> solver gets batch=2
+    policy.get_action(info)
+    assert solver.call_count == 1
+    assert solver.last_batch_size == 2
+    # receding_horizon=3, one action popped -> 2 left in each buffer
+    assert len(policy._action_buffer[0]) == 2
+    assert len(policy._action_buffer[1]) == 2
+    # _next_init persists for all envs after warm-start
+    assert policy._next_init is not None
+    assert policy._next_init.shape[0] == 2
+
+    # Simulate env 0 needing re-plan early (e.g., terminated/reset) by clearing its buffer
+    policy._action_buffer[0].clear()
+    next_init_before = policy._next_init.clone()
+
+    # Second call: only env 0 needs re-plan -> solver gets batch=1
+    policy.get_action(info)
+    assert solver.call_count == 2
+    assert solver.last_batch_size == 1
+    # env 0 re-planned (3 actions, 1 popped -> 2 remaining)
+    assert len(policy._action_buffer[0]) == 2
+    # env 1 continued draining its old plan (2 -> 1)
+    assert len(policy._action_buffer[1]) == 1
+    # env 1's warm-start slot should be untouched; env 0's slot was overwritten
+    assert torch.equal(policy._next_init[1], next_init_before[1])
+
+
 def test_worldmodel_policy_no_warm_start():
     """Test WorldModelPolicy without warm start."""
     solver = MockSolver()
@@ -552,6 +609,7 @@ def test_worldmodel_policy_no_warm_start():
     mock_env = MagicMock()
     mock_env.num_envs = 1
     mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
     policy.set_env(mock_env)
 
     info = {

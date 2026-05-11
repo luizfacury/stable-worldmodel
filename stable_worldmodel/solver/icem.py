@@ -11,6 +11,7 @@ from loguru import logger as logging
 
 from stable_worldmodel.protocols import Costable
 from stable_worldmodel.solver.utils import prepare_init_action
+from .callbacks import Callback
 
 
 class ICEMSolver:
@@ -51,6 +52,7 @@ class ICEMSolver:
         return_mean: bool = True,
         device: str | torch.device = 'cpu',
         seed: int = 1234,
+        callbacks: list[Callback] | None = None,
     ) -> None:
         self.model = model
         self.batch_size = batch_size
@@ -64,6 +66,11 @@ class ICEMSolver:
         self.return_mean = return_mean
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
+        self.callbacks = list(callbacks) if callbacks else []
+        try:
+            self._dtype = next(model.parameters()).dtype
+        except (AttributeError, StopIteration):
+            self._dtype = torch.float32
 
     def configure(
         self, *, action_space: gym.Space, n_envs: int, config: Any
@@ -76,12 +83,14 @@ class ICEMSolver:
         self._configured = True
 
         if isinstance(action_space, Box):
+            # candidates have last-dim action_dim * action_block; tile bounds
+            # so clamp broadcasts over the flattened block.
             self._action_low = torch.tensor(
-                action_space.low[0], device=self.device, dtype=torch.float32
-            )
+                action_space.low[0], device=self.device, dtype=self.dtype
+            ).repeat(self._config.action_block)
             self._action_high = torch.tensor(
-                action_space.high[0], device=self.device, dtype=torch.float32
-            )
+                action_space.high[0], device=self.device, dtype=self.dtype
+            ).repeat(self._config.action_block)
         else:
             logging.warning(
                 f'Action space is discrete, got {type(action_space)}. ICEMSolver may not work as expected.'
@@ -104,22 +113,36 @@ class ICEMSolver:
         """Planning horizon in timesteps."""
         return self._config.horizon
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
     def __call__(self, *args: Any, **kwargs: Any) -> dict:
         """Make solver callable, forwarding to solve()."""
         return self.solve(*args, **kwargs)
 
     def init_action_distrib(
-        self, actions: torch.Tensor
+        self, n_envs: int, actions: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Initialize the action distribution parameters (mean and variance)."""
-        assert actions.shape == (self.n_envs, self.horizon, self.action_dim), (
-            f'Expected actions shape ({self.n_envs}, {self.horizon}, {self.action_dim}), '
-            f'got {tuple(actions.shape)}'
-        )
         var = self.var_scale * torch.ones(
-            [self.n_envs, self.horizon, self.action_dim]
+            [n_envs, self.horizon, self.action_dim], dtype=self.dtype
         )
-        return actions, var
+        mean = (
+            torch.zeros([n_envs, 0, self.action_dim], dtype=self.dtype)
+            if actions is None
+            else actions
+        )
+
+        remaining = self.horizon - mean.shape[1]
+        if remaining > 0:
+            device = mean.device
+            new_mean = torch.zeros(
+                [n_envs, remaining, self.action_dim], dtype=self.dtype
+            )
+            mean = torch.cat([mean, new_mean], dim=1).to(device)
+
+        return mean, var
 
     @torch.inference_mode()
     def solve(
@@ -133,22 +156,28 @@ class ICEMSolver:
             'var': [],
         }
 
+        # Batch size is taken from info_dict so callers can solve for a subset of envs
+        total_envs = len(next(iter(info_dict.values())))
+
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
             self.model,
             info_dict,
             init_action,
             self.horizon,
-            n_envs=self.n_envs,
+            n_envs=total_envs,
             action_dim=self.action_dim,
         )
 
-        mean, var = self.init_action_distrib(init_action)
+        mean, var = self.init_action_distrib(total_envs, init_action)
         mean = mean.to(self.device)
         var = var.to(self.device)
 
-        for start_idx in range(0, self.n_envs, self.batch_size):
-            end_idx = min(start_idx + self.batch_size, self.n_envs)
+        for cb in self.callbacks:
+            cb.reset()
+
+        for start_idx in range(0, total_envs, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, total_envs)
             current_bs = end_idx - start_idx
 
             batch_mean = mean[start_idx:end_idx]
@@ -158,9 +187,15 @@ class ICEMSolver:
             for k, v in info_dict.items():
                 v_batch = v[start_idx:end_idx]
                 if torch.is_tensor(v):
-                    v_batch = v_batch.unsqueeze(1)
-                    v_batch = v_batch.expand(
-                        current_bs, self.num_samples, *v_batch.shape[2:]
+                    target_dtype = (
+                        self.dtype if v_batch.is_floating_point() else None
+                    )
+                    v_batch = (
+                        v_batch.to(device=self.device, dtype=target_dtype)
+                        .unsqueeze(1)
+                        .expand(
+                            current_bs, self.num_samples, *v_batch.shape[1:]
+                        )
                     )
                 elif isinstance(v, np.ndarray):
                     v_batch = np.repeat(
@@ -182,10 +217,15 @@ class ICEMSolver:
                 self.action_dim,
                 self.horizon,
             )
-            freqs = torch.fft.rfftfreq(self.horizon, device=self.device)
+            freqs = torch.fft.rfftfreq(self.horizon, device=self.device).to(
+                self.dtype
+            )
             freqs[0] = 1.0
             noise_scale = freqs.pow(-self.noise_beta / 2)
             noise_scale[0] = noise_scale[1]
+
+            for cb in self.callbacks:
+                cb.start_batch()
 
             for step in range(self.n_steps):
                 # Colored noise: generate with temporal axis last, then transpose
@@ -194,12 +234,14 @@ class ICEMSolver:
                         noise_shape,
                         generator=self.torch_gen,
                         device=self.device,
+                        dtype=self.dtype,
                     )
                 else:
                     white = torch.randn(
                         noise_shape,
                         generator=self.torch_gen,
                         device=self.device,
+                        dtype=self.dtype,
                     )
                     fft = torch.fft.rfft(white, dim=-1)
                     colored = torch.fft.irfft(
@@ -231,8 +273,7 @@ class ICEMSolver:
                         self._action_low, self._action_high
                     )
 
-                current_info = expanded_infos.copy()
-                costs = self.model.get_cost(current_info, candidates)
+                costs = self.model.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (
                     f'Expected cost to be a torch.Tensor, got {type(costs)}'
@@ -255,12 +296,30 @@ class ICEMSolver:
                 # Momentum update
                 elite_mean = topk_candidates.mean(dim=1)
                 elite_var = topk_candidates.std(dim=1)
+                prev_mean = batch_mean
+                prev_var = batch_var
                 batch_mean = (
                     self.alpha * batch_mean + (1 - self.alpha) * elite_mean
                 )
                 batch_var = (
                     self.alpha * batch_var + (1 - self.alpha) * elite_var
                 )
+
+                for cb in self.callbacks:
+                    cb(
+                        step=step,
+                        candidates=candidates,
+                        costs=costs,
+                        topk_vals=topk_vals,
+                        topk_inds=topk_inds,
+                        topk_candidates=topk_candidates,
+                        mean=batch_mean,
+                        var=batch_var,
+                        prev_mean=prev_mean,
+                        prev_var=prev_var,
+                        action_low=self._action_low,
+                        action_high=self._action_high,
+                    )
 
             final_batch_cost = topk_vals.mean(dim=1).cpu().tolist()
 
@@ -276,6 +335,12 @@ class ICEMSolver:
         outputs['actions'] = mean.detach().cpu()
         outputs['mean'] = [mean.detach().cpu()]
         outputs['var'] = [var.detach().cpu()]
+
+        if self.callbacks:
+            outputs['callbacks'] = {}
+            for cb in self.callbacks:
+                cb.end_solve()
+                outputs['callbacks'][cb.output_key] = cb.history
 
         print(f'iCEM solve time: {time.time() - start_time:.4f} seconds')
         return outputs
